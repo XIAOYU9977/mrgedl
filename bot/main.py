@@ -162,12 +162,23 @@ async def cancel_cmd(client, message: Message):
     
     await message.reply("❌ Proses dibatalkan dan file sementara telah dihapus.")
 
-@app.on_callback_query(filters.regex(r"^mi_"))
+@app.on_callback_query(filters.regex(r"^mi_show"))
 async def mediainfo_cb(client, cb: CallbackQuery):
     uid = cb.from_user.id
     session = get_session(uid)
-    info = session.get("last_mediainfo", "Informasi tidak tersedia atau sudah dihapus.")
-    await cb.answer(info, show_alert=True)
+    info = session.get("last_mediainfo")
+    
+    if not info:
+        await cb.answer("❌ Informasi sudah kedaluwarsa atau file telah dihapus.", show_alert=True)
+        return
+
+    await cb.answer()
+    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Tutup Info", callback_data="mi_close")]])
+    await client.send_message(uid, info, reply_markup=btn, parse_mode=enums.ParseMode.MARKDOWN)
+
+@app.on_callback_query(filters.regex(r"^mi_close"))
+async def close_mi_cb(client, cb: CallbackQuery):
+    await cb.message.delete()
 
 @app.on_message(filters.command("merge") & filters.private)
 async def merge_cmd(client, message: Message):

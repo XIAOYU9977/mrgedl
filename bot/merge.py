@@ -13,6 +13,27 @@ from bot.utils import format_duration, format_size
 
 logger = logging.getLogger(__name__)
 
+async def get_video_bitrate(file_path: Path) -> int:
+    """Get the average bitrate of a video file using ffprobe (in bps)."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=bit_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            val = stdout.decode().strip()
+            return int(val) if val.isdigit() else 0
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting bitrate for {file_path}: {e}")
+        return 0
+
 async def get_video_duration(file_path: Path) -> float:
     """Get the duration of a video file using ffprobe."""
     try:
@@ -111,17 +132,30 @@ async def merge_video_files(list_file: Path, output_file: Path, total_duration: 
             logger.error(f"Hardsub Phase 1 failed: {e1.decode() if e1 else 'Unknown'}")
             return False
             
-        # Step 2: Burn subtitles and re-encode with CUSTOM STYLING
-        logger.info("Hardsub Phase 2: Burning subtitles with custom styling")
+        # Step 2: Burn subtitles with bitrate matching to keep size similar
+        logger.info("Hardsub Phase 2: Burning subtitles with size optimization")
         escaped_sub_path = escape_ffmpeg_path(str(intermediate_file.absolute()))
+        
+        # Get original bitrate to match size
+        orig_bitrate = await get_video_bitrate(intermediate_file)
         
         cmd = [
             'ffmpeg', '-y', '-i', str(intermediate_file),
             '-vf', f"subtitles='{escaped_sub_path}':force_style='{hardsub_style}'", 
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-c:v', 'libx264', '-preset', 'fast'
+        ]
+        
+        if orig_bitrate > 0:
+            # Match original bitrate to keep file size almost identical
+            cmd.extend(['-b:v', str(orig_bitrate), '-maxrate', str(int(orig_bitrate * 1.5)), '-bufsize', str(orig_bitrate * 2)])
+        else:
+            # Fallback to a efficient CRF if bitrate detection fails
+            cmd.extend(['-crf', '24'])
+            
+        cmd.extend([
             '-c:a', 'aac', '-b:a', '128k',
             '-progress', 'pipe:1', str(output_file)
-        ]
+        ])
     else:
         # Softsub (Stream Copy)
         cmd = [
