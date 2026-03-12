@@ -1,0 +1,1192 @@
+import os
+import asyncio
+import json
+import logging
+import re
+import shutil
+import subprocess
+import psutil
+import time
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
+import aiofiles
+
+# ==================== INSTALL ====================
+# pip install telethon aiofiles psutil
+
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
+from telethon.errors import SessionPasswordNeededError
+from telethon import helpers
+
+# ==================== CONFIGURASI ====================
+API_ID    = 30653860
+API_HASH  = "98e0a87077d4fc642ce183dfd7f46a19"
+BOT_TOKEN = "8670555448:AAHz85JOrOjwyY_V10NvbHB_Fipx5qGuy9Y"
+
+BASE_DIR      = Path(__file__).parent
+DOWNLOADS_DIR = BASE_DIR / "downloads"
+FFMPEG_PATH   = "ffmpeg"
+FFPROBE_PATH  = "ffprobe"
+
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+
+MAX_FILE_SIZE_GB    = 5
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_GB * 1024 * 1024 * 1024
+MAX_CONCURRENT_MERGE = 2
+
+MIN_RAM_AVAILABLE_GB = 1.5
+MIN_DISK_FREE_GB     = 10
+
+DOWNLOAD_TIMEOUT         = 600
+MERGE_TIMEOUT            = 28800
+PROGRESS_UPDATE_INTERVAL = 3
+
+FALLBACK_CRF_VALUE     = 18
+FALLBACK_AUDIO_BITRATE = "192k"
+
+# Upload: chunk 512 KB x 4 worker paralel = jauh lebih cepat dari default
+UPLOAD_PART_SIZE_KB = 512
+UPLOAD_WORKERS      = 15   # 15 koneksi paralel TCP
+
+# Download paralel
+DOWNLOAD_REQUEST_SIZE = 1 * 1024 * 1024   # 1 MB per request
+DOWNLOAD_WORKERS      = 15
+
+# Prioritas bahasa subtitle
+SUBTITLE_LANG_PRIORITY = ["id", "ind", "indonesian", "indonesia", "en", "eng", "english"]
+
+MSG_START = (
+    "🎬 **Merge Video Bot (UP TO 5GB!)**\n\n"
+    "Kirim beberapa video, saya gabungkan jadi satu file.\n\n"
+    "**Fitur:**\n"
+    "- File hingga 5GB\n"
+    "- Stream copy tanpa re-encode jika codec sama\n"
+    "- Pilih format: MP4 atau MKV\n"
+    "- Soft subtitle tx3g/Indonesian dipertahankan\n"
+    f"- Antrian pintar, maks {MAX_CONCURRENT_MERGE} user bersamaan\n"
+    "- Upload paralel lebih cepat\n\n"
+    "**Cara pakai:**\n"
+    "1. Kirim video (boleh beberapa kali)\n"
+    "2. Klik Lihat Detail\n"
+    "3. Pilih format output (MP4 atau MKV)\n"
+    "4. Klik Merge\n\n"
+    f"Maksimal 10 video | Total maks {MAX_FILE_SIZE_GB} GB"
+)
+
+MSG_HELP = (
+    "**Bantuan Merge Bot**\n\n"
+    "**Format Output:**\n"
+    "- MP4: Kompatibel luas (WA, Telegram, media player)\n"
+    "- MKV: Lebih fleksibel, support banyak subtitle\n\n"
+    "**Mode Merge:**\n"
+    "- Stream Copy: Tanpa re-encode, codec sama, tercepat\n"
+    "- Re-encode: Fallback otomatis jika codec berbeda\n\n"
+    "**Soft Subtitle (tx3g/mov_text):**\n"
+    "- Subtitle Indonesian dideteksi dan dipertahankan\n"
+    "- MP4: format mov_text (kompatibel tx3g)\n"
+    "- MKV: format SRT\n\n"
+    "**Perintah:**\n"
+    "/start - Menu utama\n"
+    "/help  - Bantuan ini\n"
+    "/cancel - Batalkan session\n\n"
+    f"Batasan: Maks 10 video | Total {MAX_FILE_SIZE_GB} GB"
+)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== UTILS ====================
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+def format_speed(bps: float) -> str:
+    if bps < 1024:
+        return f"{bps:.1f} B/s"
+    elif bps < 1024 * 1024:
+        return f"{bps / 1024:.1f} KB/s"
+    elif bps < 1024 * 1024 * 1024:
+        return f"{bps / (1024 * 1024):.1f} MB/s"
+    return f"{bps / (1024 * 1024 * 1024):.2f} GB/s"
+
+def format_duration(seconds: float) -> str:
+    d = timedelta(seconds=int(seconds))
+    h = d.seconds // 3600
+    m = (d.seconds % 3600) // 60
+    s = d.seconds % 60
+    if h > 0:
+        return f"{h}j {m}m {s}d"
+    elif m > 0:
+        return f"{m}m {s}d"
+    return f"{s}d"
+
+def progress_bar(pct: float, length: int = 16) -> str:
+    filled = int(length * pct / 100)
+    return chr(9608) * filled + chr(9617) * (length - filled)
+
+def extract_episode_number(filename: str) -> int:
+    for p in [
+        r'[Ee]p(?:isode)?[\s._-]*(\d+)',
+        r'[Pp]art[\s._-]*(\d+)',
+        r'(\d+)[\s._-]*[Oo]f',
+        r'\[(\d+)\]',
+        r'(\d{1,4})'
+    ]:
+        m = re.search(p, filename)
+        if m:
+            return int(m.group(1))
+    return 0
+
+def clean_filename(filename: str) -> str:
+    name = Path(filename).stem
+    return name[:27] + "..." if len(name) > 30 else name
+
+def get_system_ram_gb()     -> float: return psutil.virtual_memory().total     / (1024 ** 3)
+def get_available_ram_gb()  -> float: return psutil.virtual_memory().available / (1024 ** 3)
+def get_disk_free_gb(p="/") -> float: return shutil.disk_usage(p).free         / (1024 ** 3)
+def get_cpu_usage()         -> float: return psutil.cpu_percent(interval=0.1)
+def get_ffmpeg_preset()     -> str:   return "fast" if get_system_ram_gb() <= 4.5 else "medium"
+
+def get_network_speed() -> Tuple[float, float]:
+    n0 = psutil.net_io_counters()
+    time.sleep(0.3)
+    n1 = psutil.net_io_counters()
+    return (n1.bytes_recv - n0.bytes_recv) / 0.3, (n1.bytes_sent - n0.bytes_sent) / 0.3
+
+# ==================== VIDEO PROBE ====================
+
+async def get_video_info(file_path: Path) -> Optional[Dict]:
+    """Analisa video, termasuk deteksi subtitle streams (tx3g, mov_text, srt, dll)."""
+    try:
+        cmd = [
+            FFPROBE_PATH, "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            str(file_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+
+        data  = json.loads(stdout)
+        video = None
+        audio = None
+        subs  = []
+
+        for stream in data.get("streams", []):
+            ct = stream.get("codec_type", "")
+            if ct == "video" and video is None:
+                video = stream
+            elif ct == "audio" and audio is None:
+                audio = stream
+            elif ct == "subtitle":
+                tags = stream.get("tags", {})
+                disp = stream.get("disposition", {})
+                subs.append({
+                    "stream_index": stream.get("index"),
+                    "codec_name":   stream.get("codec_name", ""),
+                    "codec_long":   stream.get("codec_long_name", ""),
+                    "lang":         tags.get("language", "").lower(),
+                    "title":        tags.get("title", ""),
+                    "is_default":   bool(disp.get("default", 0)),
+                    "is_forced":    bool(disp.get("forced",  0)),
+                })
+
+        fmt = data.get("format", {})
+        try:
+            fps_val = eval((video or {}).get("r_frame_rate", "0/1"))
+        except Exception:
+            fps_val = 0.0
+
+        return {
+            "duration":         float(fmt.get("duration", 0)),
+            "size":             int(fmt.get("size", 0)),
+            "bit_rate":         int(fmt.get("bit_rate", 0)) if fmt.get("bit_rate") else 0,
+            "video_codec":      video.get("codec_name")      if video else None,
+            "video_codec_long": video.get("codec_long_name") if video else None,
+            "width":            int(video.get("width", 0))   if video else 0,
+            "height":           int(video.get("height", 0))  if video else 0,
+            "fps":              fps_val,
+            "audio_codec":      audio.get("codec_name")      if audio else None,
+            "channels":         audio.get("channels", 0)     if audio else 0,
+            "subtitle_streams": subs,
+        }
+    except Exception as e:
+        logger.error(f"get_video_info error: {e}")
+        return None
+
+
+def pick_best_subtitle(subs: List[Dict]) -> Optional[Dict]:
+    if not subs:
+        return None
+    # Default + Indonesia
+    for s in subs:
+        if s.get("is_default") and any(k in s.get("lang", "") for k in ["id", "ind"]):
+            return s
+    # Prioritas bahasa
+    for lang_key in SUBTITLE_LANG_PRIORITY:
+        for s in subs:
+            if lang_key in s.get("lang", "").lower() or lang_key in s.get("title", "").lower():
+                return s
+    return subs[0]
+
+
+def check_compatibility(videos_info: List[Dict]) -> Tuple[bool, str, Dict]:
+    if not videos_info or not all(videos_info):
+        return False, "Beberapa video tidak bisa dianalisa", {}
+    ref = videos_info[0]
+    vcodes = set(i.get("video_codec") for i in videos_info)
+    if len(vcodes) > 1:
+        return False, f"Codec video berbeda: {', '.join(str(c) for c in vcodes)}", {}
+    acodes = set(i.get("audio_codec") for i in videos_info if i.get("audio_codec"))
+    if len(acodes) > 1:
+        return False, f"Codec audio berbeda: {', '.join(str(c) for c in acodes)}", {}
+    ress = set((i.get("width"), i.get("height")) for i in videos_info)
+    if len(ress) > 1:
+        return False, f"Resolusi berbeda: {ress}", {}
+    fps_list = [i.get("fps", 0) for i in videos_info]
+    if max(fps_list) - min(fps_list) > 0.1:
+        return False, f"FPS berbeda: {fps_list}", {}
+    return True, "Semua video kompatibel", {
+        "video_codec": ref.get("video_codec"),
+        "audio_codec": ref.get("audio_codec"),
+        "width":       ref.get("width"),
+        "height":      ref.get("height"),
+        "fps":         ref.get("fps"),
+    }
+
+
+async def create_concat_file(file_paths: List[Path], list_file: Path) -> bool:
+    try:
+        async with aiofiles.open(list_file, 'w', encoding='utf-8') as f:
+            for fp in file_paths:
+                escaped = str(fp.absolute()).replace("'", "'\\''")
+                await f.write(f"file '{escaped}'\n")
+        return True
+    except Exception as e:
+        logger.error(f"create_concat_file error: {e}")
+        return False
+
+
+async def parse_ffmpeg_progress(line: str) -> Dict:
+    result = {}
+    for key, pat in {
+        "out_time_ms": r"out_time_ms=(\d+)",
+        "out_time":    r"out_time=(\d+:\d+:\d+\.\d+)",
+        "speed":       r"speed=([\d.]+)x",
+        "progress":    r"progress=(\w+)",
+    }.items():
+        m = re.search(pat, line)
+        if m:
+            result[key] = m.group(1)
+    return result
+
+# ==================== SESSION ====================
+
+class MergeSession:
+    def __init__(self, user_id: int, session_dir: Path):
+        self.user_id        = user_id
+        self.session_dir    = session_dir
+        self.videos         : List[Tuple[Path, str, int]] = []
+        self.videos_info    : List[Optional[Dict]] = []
+        self.status_message = None
+        self.is_processing  = False
+        self.created_at     = datetime.now()
+        self.queue_position = None
+        self.output_format  = "mp4"
+        # ── Cancel support ────────────────────────────────────────────────
+        self.cancel_flag    = False          # set True → hentikan semua proses
+        self.ffmpeg_process = None           # referensi proses FFmpeg aktif
+        self.download_task  = None           # referensi asyncio task download aktif
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+
+    def request_cancel(self):
+        """Tandai session untuk dibatalkan secara paksa."""
+        self.cancel_flag = True
+        # Kill FFmpeg jika sedang berjalan
+        if self.ffmpeg_process is not None:
+            try:
+                self.ffmpeg_process.kill()
+                logger.info(f"FFmpeg killed untuk user {self.user_id}")
+            except Exception as e:
+                logger.warning(f"Gagal kill FFmpeg: {e}")
+        # Cancel download task jika sedang berjalan
+        if self.download_task is not None and not self.download_task.done():
+            self.download_task.cancel()
+            logger.info(f"Download task cancelled untuk user {self.user_id}")
+
+    async def add_video(self, fp: Path, fn: str, fs: int) -> bool:
+        if len(self.videos) >= 10:
+            return False
+        self.videos.append((fp, fn, fs))
+        self.videos_info.append(await get_video_info(fp))
+        return True
+
+    def get_total_size(self)     -> int:   return sum(s for _, _, s in self.videos)
+    def get_total_duration(self) -> float: return sum((i or {}).get("duration", 0) for i in self.videos_info)
+    def get_video_names(self)    -> List[str]: return [clean_filename(n) for _, n, _ in self.videos]
+    def get_episode_numbers(self)-> List[int]: return [extract_episode_number(n) for _, n, _ in self.videos]
+
+    async def analyze_compatibility(self) -> Tuple[bool, str, Dict]:
+        if len(self.videos_info) < len(self.videos):
+            return False, "Menunggu analisa video", {}
+        return check_compatibility(self.videos_info)
+
+    def sort_videos_by_episode(self):
+        eps = self.get_episode_numbers()
+        idx = sorted(range(len(eps)), key=lambda i: eps[i] if eps[i] > 0 else float('inf'))
+        self.videos      = [self.videos[i]      for i in idx]
+        self.videos_info = [self.videos_info[i] for i in idx] if len(self.videos_info) == len(self.videos) else self.videos_info
+
+    def collect_all_subtitles(self) -> List[Dict]:
+        seen, result = set(), []
+        for info in self.videos_info:
+            for s in (info or {}).get("subtitle_streams", []):
+                key = (s.get("lang", ""), s.get("title", ""))
+                if key not in seen:
+                    seen.add(key)
+                    result.append(s)
+        return result
+
+    def cleanup(self):
+        try:
+            if self.session_dir.exists():
+                shutil.rmtree(self.session_dir)
+                logger.info(f"Session {self.user_id} dibersihkan")
+        except Exception as e:
+            logger.error(f"cleanup error: {e}")
+
+# ==================== MERGE HANDLER ====================
+
+class MergeHandler:
+    def __init__(self):
+        self.active_merges    = {}
+        self.global_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MERGE)
+        self.merge_queue      = asyncio.Queue()
+        self.processing_queue = False
+
+    async def process_queue(self):
+        if self.processing_queue:
+            return
+        self.processing_queue = True
+        while True:
+            try:
+                uid, session, prog_cb, future = await self.merge_queue.get()
+                await self._update_positions()
+                if session.status_message:
+                    try:
+                        await session.status_message.edit(
+                            "**Merge akan segera dimulai...**\n\nMohon tunggu.",
+                            parse_mode='md'
+                        )
+                    except Exception:
+                        pass
+                async with self.global_semaphore:
+                    try:
+                        result = await self.merge_videos(session, prog_cb)
+                        future.set_result(result)
+                    except Exception as e:
+                        future.set_exception(e)
+                    finally:
+                        await self._update_positions()
+                self.merge_queue.task_done()
+            except Exception as e:
+                logger.error(f"process_queue error: {e}")
+                await asyncio.sleep(1)
+
+    async def _update_positions(self):
+        ql = list(self.merge_queue._queue)
+        for idx, (_, session, _, _) in enumerate(ql):
+            if session and session.status_message:
+                try:
+                    await session.status_message.edit(
+                        f"**Dalam Antrian — Posisi {idx+1} / {len(ql)}**\n\n/cancel untuk membatalkan.",
+                        parse_mode='md'
+                    )
+                except Exception:
+                    pass
+
+    async def queue_merge(self, uid: int, session: MergeSession, prog_cb) -> asyncio.Future:
+        future = asyncio.Future()
+        if get_available_ram_gb() < MIN_RAM_AVAILABLE_GB:
+            raise Exception(f"RAM tersisa {get_available_ram_gb():.1f}GB. Minimal {MIN_RAM_AVAILABLE_GB}GB.")
+        if get_disk_free_gb() < MIN_DISK_FREE_GB:
+            raise Exception(f"Disk kosong {get_disk_free_gb():.1f}GB. Minimal {MIN_DISK_FREE_GB}GB.")
+        await self.merge_queue.put((uid, session, prog_cb, future))
+        await self._update_positions()
+        asyncio.create_task(self.process_queue())
+        return future
+
+    async def merge_videos(
+        self,
+        session: MergeSession,
+        progress_callback=None
+    ) -> Tuple[bool, Optional[Path], str, Dict]:
+        """
+        Merge dengan stream copy (tidak re-encode jika codec sama).
+        Subtitle tx3g dipertahankan:
+          - MP4 output: dikonversi ke mov_text (teks soft sub, compatible tx3g)
+          - MKV output: dikonversi ke srt (lebih ringan)
+        Upload lebih cepat dengan workers paralel.
+        """
+        try:
+            if get_available_ram_gb() < MIN_RAM_AVAILABLE_GB:
+                return False, None, "RAM tidak cukup", {}
+            if get_disk_free_gb() < MIN_DISK_FREE_GB:
+                return False, None, "Disk tidak cukup", {}
+
+            session.sort_videos_by_episode()
+            compatible, compat_msg, cinfo = await session.analyze_compatibility()
+
+            out_ext     = session.output_format.lower()
+            ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = session.session_dir / f"merged_{ts}.{out_ext}"
+            list_file   = session.session_dir / "concat_list.txt"
+
+            if not await create_concat_file([fp for fp, _, _ in session.videos], list_file):
+                return False, None, "Gagal membuat concat file", {}
+
+            preset   = get_ffmpeg_preset()
+            all_subs = session.collect_all_subtitles()
+            best_sub = pick_best_subtitle(all_subs)
+            has_subs = bool(all_subs)
+
+            # Codec subtitle output: mov_text untuk MP4, srt untuk MKV
+            sub_codec_out = "mov_text" if out_ext == "mp4" else "srt"
+            sub_lang      = (best_sub or {}).get("lang", "ind") or "ind"
+            sub_title     = (best_sub or {}).get("title", "Indonesian") or "Indonesian"
+            sub_codec_src = (best_sub or {}).get("codec_name", "tx3g")
+
+            # ── Build FFmpeg command ──────────────────────────────────────────
+            cmd = [FFMPEG_PATH, "-f", "concat", "-safe", "0", "-i", str(list_file)]
+
+            # Map stream: video + audio + subtitle (opsional)
+            cmd += ["-map", "0:v:0", "-map", "0:a:0"]
+            if has_subs:
+                cmd += ["-map", "0:s?"]
+
+            if compatible:
+                # Stream copy video & audio
+                cmd += ["-c:v", "copy", "-c:a", "copy"]
+                mode = "Stream Copy (Tanpa Re-Encode)"
+            else:
+                # Re-encode
+                cmd += [
+                    "-c:v", "libx264", "-preset", preset, "-crf", str(FALLBACK_CRF_VALUE),
+                    "-c:a", "aac", "-b:a", FALLBACK_AUDIO_BITRATE,
+                ]
+                mode = f"Re-encode (CRF {FALLBACK_CRF_VALUE}, Preset {preset}) — {compat_msg}"
+
+            # Subtitle: konversi tx3g/any -> mov_text atau srt
+            if has_subs:
+                cmd += [
+                    "-c:s", sub_codec_out,
+                    "-metadata:s:s:0", f"language={sub_lang}",
+                    "-metadata:s:s:0", f"title={sub_title}",
+                    "-disposition:s:0", "default",
+                ]
+
+            if out_ext == "mp4":
+                cmd += ["-movflags", "+faststart"]
+
+            cmd += ["-progress", "pipe:1", "-y", str(output_path)]
+
+            logger.info(f"[Merge] user={session.user_id} fmt={out_ext.upper()} mode={mode}")
+            logger.info(f"[Merge] subtitle: has={has_subs} src={sub_codec_src} out={sub_codec_out} lang={sub_lang}")
+            logger.info(f"[Merge] cmd: {' '.join(cmd)}")
+
+            stats = {
+                "mode":           mode,
+                "total_size":     session.get_total_size(),
+                "total_duration": session.get_total_duration(),
+                "compatible":     compatible,
+                "preset":         preset,
+                "output_format":  out_ext,
+                "has_subtitle":   has_subs,
+                "sub_lang":       sub_lang if has_subs else "—",
+                "sub_title":      sub_title if has_subs else "—",
+                "sub_codec_src":  sub_codec_src if has_subs else "—",
+                "sub_codec_out":  sub_codec_out if has_subs else "—",
+            }
+
+            # ── Run FFmpeg ────────────────────────────────────────────────────
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                session.ffmpeg_process = process   # simpan agar bisa di-kill via /cancel
+                total_dur = session.get_total_duration()
+                last_upd  = 0.0
+
+                async def read_output():
+                    nonlocal last_upd
+                    while True:
+                        # Cek cancel flag setiap iterasi
+                        if session.cancel_flag:
+                            process.kill()
+                            break
+                        try:
+                            line = await asyncio.wait_for(process.stdout.readline(), timeout=120)
+                        except asyncio.TimeoutError:
+                            logger.error("FFmpeg stdout timeout")
+                            process.kill()
+                            break
+                        if not line:
+                            break
+                        pdata = await parse_ffmpeg_progress(line.decode().strip())
+                        if "out_time_ms" in pdata and total_dur > 0:
+                            cur_t = int(pdata["out_time_ms"]) / 1_000_000
+                            pct   = min(100.0, cur_t / total_dur * 100)
+                            now   = time.time()
+                            if now - last_upd > PROGRESS_UPDATE_INTERVAL and progress_callback:
+                                await progress_callback(pct, pdata)
+                                last_upd = now
+
+                await asyncio.wait_for(
+                    asyncio.gather(read_output(), process.wait()),
+                    timeout=MERGE_TIMEOUT
+                )
+                session.ffmpeg_process = None
+
+            except asyncio.TimeoutError:
+                process.kill()
+                session.ffmpeg_process = None
+                return False, None, "Merge timeout — file terlalu besar", stats
+
+            # Cek apakah dibatalkan user
+            if session.cancel_flag:
+                return False, None, "CANCELLED", stats
+
+            if process.returncode != 0:
+                err = (await process.stderr.read()).decode()[:600]
+                logger.error(f"FFmpeg error: {err}")
+                return False, None, f"FFmpeg error:\n{err}", stats
+
+            if not output_path.exists():
+                return False, None, "File output tidak dibuat", stats
+
+            out_size  = output_path.stat().st_size
+            orig_size = session.get_total_size()
+            diff      = out_size - orig_size
+            stats.update({
+                "output_size":   out_size,
+                "size_diff":     diff,
+                "size_diff_pct": (diff / orig_size * 100) if orig_size else 0,
+            })
+            return True, output_path, "Berhasil", stats
+
+        except Exception as e:
+            logger.error(f"merge_videos exception: {e}", exc_info=True)
+            return False, None, f"Error: {e}", {}
+
+    def is_merging(self, uid: int) -> bool:
+        return uid in self.active_merges and not self.active_merges[uid].done()
+
+    def add_merge_task(self, uid: int, task: asyncio.Task):
+        self.active_merges[uid] = task
+
+    def remove_merge_task(self, uid: int):
+        self.active_merges.pop(uid, None)
+
+# ==================== TELEGRAM BOT ====================
+
+class TelegramBot:
+    def __init__(self, api_id, api_hash, bot_token):
+        self.api_id        = api_id
+        self.api_hash      = api_hash
+        self.bot_token     = bot_token
+        self.client        = None
+        self.sessions      : Dict[int, MergeSession] = {}
+        self.merge_handler = MergeHandler()
+
+    async def start(self):
+        self.client = TelegramClient('bot_session', self.api_id, self.api_hash)
+        await self.client.start(bot_token=self.bot_token)
+
+        # incoming=True: hanya proses pesan masuk (bukan yang dikirim bot sendiri)
+        # pattern pakai regex agar match /start, /start@botname, dll
+        self.client.add_event_handler(
+            self.cmd_start,
+            events.NewMessage(pattern=r'^/start', incoming=True)
+        )
+        self.client.add_event_handler(
+            self.cmd_help,
+            events.NewMessage(pattern=r'^/help', incoming=True)
+        )
+        self.client.add_event_handler(
+            self.cmd_cancel,
+            events.NewMessage(pattern=r'^/cancel', incoming=True)
+        )
+        self.client.add_event_handler(
+            self.video_handler,
+            events.NewMessage(
+                incoming=True,
+                func=lambda e: (
+                    e.message is not None
+                    and e.message.file is not None
+                    and getattr(e.message.file, 'mime_type', '') is not None
+                    and getattr(e.message.file, 'mime_type', '').startswith('video/')
+                )
+            )
+        )
+        self.client.add_event_handler(self.callback_handler, events.CallbackQuery())
+
+        me = await self.client.get_me()
+        logger.info(f"Bot started! @{me.username} (id={me.id})")
+        asyncio.create_task(self.auto_cleanup_loop())
+        await self.client.run_until_disconnected()
+
+    # ── Commands ──────────────────────────────────────────────────────────────
+
+    async def cmd_start(self, event):
+        try:
+            await event.reply(MSG_START, parse_mode='md')
+        except Exception as e:
+            logger.error(f"cmd_start error: {e}")
+            # Fallback tanpa markdown jika parse gagal
+            await event.reply("Merge Video Bot\n\nKirim video untuk mulai. Gunakan /help untuk bantuan.")
+
+    async def cmd_help(self, event):
+        try:
+            await event.reply(MSG_HELP, parse_mode='md')
+        except Exception as e:
+            logger.error(f"cmd_help error: {e}")
+            await event.reply("Kirim video ke bot ini. Setelah semua video dikirim, klik tombol Merge.")
+
+    async def cmd_cancel(self, event):
+        uid = event.sender_id
+        if uid not in self.sessions:
+            await event.reply('Tidak ada session aktif. Gunakan /start untuk mulai baru.')
+            return
+
+        s = self.sessions.pop(uid)
+
+        # ── Paksa hentikan semua proses aktif ─────────────────────────────
+        s.request_cancel()   # kill FFmpeg + cancel download task
+
+        # Beri jeda singkat agar proses sempat mati
+        await asyncio.sleep(0.5)
+
+        # Hapus pesan status lama
+        if s.status_message:
+            try: await s.status_message.delete()
+            except: pass
+
+        # Hapus semua file sementara
+        s.cleanup()
+
+        # Bersihkan dari merge handler
+        self.merge_handler.remove_merge_task(uid)
+
+        await event.reply(
+            "**Session dibatalkan paksa!**\n\n"
+            "FFmpeg dihentikan\n"
+            "Download dihentikan\n"
+            "Semua file sementara dihapus\n\n"
+            "Kirim /start untuk mulai baru.",
+            parse_mode='md'
+        )
+        logger.info(f"Force cancel untuk user {uid}")
+
+    # ── Status helper ─────────────────────────────────────────────────────────
+
+    async def update_status(self, session: MergeSession, text: str,
+                             buttons=None, parse_mode: str = 'md'):
+        try:
+            if session.status_message:
+                try:
+                    await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
+                    return
+                except Exception:
+                    pass
+            session.status_message = await self.client.send_message(
+                session.user_id, text, buttons=buttons, parse_mode=parse_mode
+            )
+        except Exception as e:
+            logger.error(f"update_status error: {e}")
+
+    # ── Video handler ─────────────────────────────────────────────────────────
+
+    async def video_handler(self, event):
+        uid       = event.sender_id
+        if self.merge_handler.is_merging(uid):
+            await event.reply("Sedang merge. Tunggu selesai atau /cancel")
+            return
+
+        file      = event.message.file
+        file_size = file.size
+        file_name = file.name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+
+        if file_size > MAX_FILE_SIZE_BYTES:
+            await event.reply(
+                f"**File terlalu besar!**\n{file_name}\n{format_size(file_size)}\nBatas: {format_size(MAX_FILE_SIZE_BYTES)}",
+                parse_mode='md'
+            )
+            return
+
+        if uid not in self.sessions:
+            sd = DOWNLOADS_DIR / f"user_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.sessions[uid] = MergeSession(uid, sd)
+
+        session = self.sessions[uid]
+
+        if session.get_total_size() + file_size > MAX_FILE_SIZE_BYTES:
+            await event.reply(
+                f"Total ukuran melebihi batas {format_size(MAX_FILE_SIZE_BYTES)}.\nGunakan /cancel untuk mulai ulang.",
+                parse_mode='md'
+            )
+            return
+
+        if not session.status_message:
+            session.status_message = await event.reply(
+                f"**Mempersiapkan download...**", parse_mode='md'
+            )
+
+        start_time = time.time()
+        last_upd   = [time.time()]
+
+        async def dl_progress(received: int, total: int):
+            now = time.time()
+            if now - last_upd[0] < PROGRESS_UPDATE_INTERVAL:
+                return
+            last_upd[0] = now
+            pct     = received / total * 100 if total else 0
+            elapsed = now - start_time
+            speed   = received / elapsed if elapsed > 0 else 0
+            remain  = (total - received) / speed if speed > 0 else 0
+            bar     = progress_bar(pct)
+            text = (
+                f"**Mendownload...**\n\n"
+                f"`{file_name[:40]}`\n"
+                f"`{bar}` {pct:.1f}%\n"
+                f"{format_size(received)} / {format_size(total)}\n"
+                f"Speed: {format_speed(speed)}\n"
+                f"Sisa: {int(remain//60)}m {int(remain%60)}s\n"
+                f"Workers: {DOWNLOAD_WORKERS} paralel | 1MB/req"
+            )
+            await self.update_status(session, text, parse_mode='md')
+
+        file_path = session.session_dir / file_name
+        try:
+            # ── Download paralel dengan iter_download ─────────────────────
+            # iter_download membuka DOWNLOAD_WORKERS koneksi TCP ke Telegram
+            # sekaligus, jauh lebih cepat dari download_media (1 koneksi)
+            dl_total    = file_size
+            dl_received = [0]
+
+            async def _run_download():
+                async with aiofiles.open(file_path, 'wb') as f_out:
+                    async for chunk in event.client.iter_download(
+                        event.message.media,
+                        request_size=DOWNLOAD_REQUEST_SIZE,
+                        dc_id=getattr(getattr(event.message.media, 'document', None) or
+                                      getattr(event.message.media, 'photo', None), 'dc_id', None),
+                    ):
+                        if session.cancel_flag:
+                            logger.info(f"Download dibatalkan untuk user {uid}")
+                            raise asyncio.CancelledError("Download dibatalkan oleh user")
+                        await f_out.write(chunk)
+                        dl_received[0] += len(chunk)
+                        await dl_progress(dl_received[0], dl_total)
+
+            dl_task = asyncio.create_task(
+                asyncio.wait_for(_run_download(), timeout=DOWNLOAD_TIMEOUT)
+            )
+            session.download_task = dl_task
+            await dl_task
+            session.download_task = None
+
+            if not file_path.exists():
+                raise Exception("File tidak terdownload dengan benar")
+
+            dl_size = file_path.stat().st_size
+            logger.info(f"Downloaded: {file_name} ({format_size(dl_size)})")
+            await session.add_video(file_path, file_name, dl_size)
+
+            info     = session.videos_info[-1] if session.videos_info else {}
+            subs     = (info or {}).get("subtitle_streams", [])
+            best_sub = pick_best_subtitle(subs)
+            sub_info = ""
+            if subs:
+                lang_str  = (best_sub or {}).get("lang", "?") or "?"
+                codec_str = (best_sub or {}).get("codec_name", "?")
+                sub_info  = f"\nSubtitle: {len(subs)} stream  best: {lang_str} ({codec_str})"
+
+            n = len(session.videos)
+            await self.update_status(
+                session,
+                f"**Download #{n} Selesai!**\n\n"
+                f"`{file_name[:40]}`\n"
+                f"{format_size(dl_size)}"
+                f"{sub_info}\n\n"
+                f"{n}/10 video  Total: {format_size(session.get_total_size())}\n\n"
+                f"Kirim video lagi atau klik tombol:",
+                buttons=[
+                    [Button.inline("Lihat Detail & Merge", b"show_summary")],
+                    [Button.inline("Batal & Hapus", b"cancel")],
+                ],
+                parse_mode='md'
+            )
+        except asyncio.CancelledError:
+            logger.info(f"Download cancelled untuk user {uid}")
+            # Jangan update status — session sudah/akan dibersihkan oleh cmd_cancel
+        except Exception as e:
+            logger.error(f"Download error: {e}", exc_info=True)
+            if not session.cancel_flag:
+                await self.update_status(session, f"**Gagal download:**\n`{str(e)[:200]}`", parse_mode='md')
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    async def show_summary(self, event, uid: int):
+        session = self.sessions.get(uid)
+        if not session:
+            return
+
+        compatible, compat_msg, cinfo = await session.analyze_compatibility()
+        all_subs   = session.collect_all_subtitles()
+        best_sub   = pick_best_subtitle(all_subs)
+        preset     = get_ffmpeg_preset()
+        cpu        = get_cpu_usage()
+        ram        = get_available_ram_gb()
+        total_ram  = get_system_ram_gb()
+        disk       = get_disk_free_gb()
+        dl_spd, ul_spd = get_network_speed()
+
+        eps   = session.get_episode_numbers()
+        names = session.get_video_names()
+        lines = []
+        for i, name in enumerate(names):
+            ep = eps[i] if i < len(eps) else 0
+            lines.append(f"  {i+1:02d}. {'Ep '+str(ep) if ep > 0 else name}")
+
+        fmt_icon  = "MP4" if session.output_format == "mp4" else "MKV"
+
+        text  = "**Ringkasan Session**\n\n"
+        text += "**Video:**\n" + "\n".join(lines[:10])
+        if len(lines) > 10:
+            text += f"\n  ...+{len(lines)-10} lainnya"
+        text += (
+            f"\n\n{len(session.videos)} video"
+            f"  |  {format_duration(session.get_total_duration())}"
+            f"  |  {format_size(session.get_total_size())}"
+        )
+
+        if compatible:
+            vc  = (cinfo.get('video_codec') or 'N/A').upper()
+            res = f"{cinfo.get('width')}x{cinfo.get('height')}" if cinfo.get('width') else "?"
+            text += f"\n\n**Mode:** Stream Copy (Tanpa Re-Encode)\nCodec: `{vc}`  Resolusi: `{res}`"
+        else:
+            text += f"\n\n**Mode:** Re-encode (CRF {FALLBACK_CRF_VALUE}, Preset `{preset}`)\nAlasan: {compat_msg}"
+
+        # Subtitle
+        text += "\n\n**Subtitle:**"
+        if all_subs:
+            for s in all_subs[:4]:
+                def_mark  = " (default)" if s.get("is_default") else ""
+                codec_str = s.get("codec_name", "?")
+                lang_str  = s.get("lang", "?") or "?"
+                title_str = f" — {s['title']}" if s.get("title") else ""
+                text += f"\n  {lang_str} ({codec_str}){title_str}{def_mark}"
+            if len(all_subs) > 4:
+                text += f"\n  ...+{len(all_subs)-4} lainnya"
+            out_codec = "mov_text" if session.output_format == "mp4" else "srt"
+            text += f"\n  Output: `{out_codec}` (default Indonesian)"
+        else:
+            text += " Tidak ada"
+
+        text += (
+            f"\n\n**Format Output:** `{fmt_icon}`\n\n"
+            f"**Server:** CPU {cpu:.0f}%  RAM {ram:.1f}/{total_ram:.1f}GB  Disk {disk:.1f}GB\n"
+            f"Net: {format_speed(dl_spd)} down  {format_speed(ul_spd)} up"
+        )
+
+        buttons = [
+            [Button.inline("Set MP4", b"fmt_mp4"), Button.inline("Set MKV", b"fmt_mkv")],
+            [Button.inline(f"Merge -> {fmt_icon}!", b"merge")],
+            [Button.inline("Batal & Hapus", b"cancel")],
+        ]
+        await self.update_status(session, text, buttons=buttons, parse_mode='md')
+
+    # ── Callback handler ──────────────────────────────────────────────────────
+
+    async def callback_handler(self, event):
+        uid  = event.sender_id
+        data = event.data.decode('utf-8')
+
+        if uid not in self.sessions:
+            await event.answer("Session tidak ditemukan. Kirim /start")
+            return
+
+        session = self.sessions[uid]
+
+        if data == "fmt_mp4":
+            session.output_format = "mp4"
+            await event.answer("Format diset ke MP4")
+            await self.show_summary(event, uid)
+            return
+
+        if data == "fmt_mkv":
+            session.output_format = "mkv"
+            await event.answer("Format diset ke MKV")
+            await self.show_summary(event, uid)
+            return
+
+        if data == "cancel":
+            session.request_cancel()
+            await asyncio.sleep(0.5)
+            if session.status_message:
+                try: await session.status_message.delete()
+                except: pass
+            session.cleanup()
+            self.merge_handler.remove_merge_task(uid)
+            self.sessions.pop(uid, None)
+            await event.answer("Session dibatalkan.")
+            try:
+                await self.client.send_message(
+                    uid,
+                    "**Dibatalkan!** Semua file sementara dihapus.\n/start untuk mulai baru.",
+                    parse_mode='md'
+                )
+            except Exception:
+                pass
+            return
+
+        if data == "show_summary":
+            await self.show_summary(event, uid)
+            await event.answer()
+            return
+
+        if data == "merge":
+            if self.merge_handler.is_merging(uid):
+                await event.answer("Merge sedang berjalan")
+                return
+
+            if len(session.videos) < 2:
+                await self.update_status(session, "Minimal 2 video untuk merge.")
+                await event.answer()
+                return
+
+            if get_available_ram_gb() < MIN_RAM_AVAILABLE_GB:
+                await self.update_status(session, f"RAM tersisa {get_available_ram_gb():.1f}GB. Tunggu lalu coba lagi.")
+                await event.answer()
+                return
+            if get_disk_free_gb() < MIN_DISK_FREE_GB:
+                await self.update_status(session, f"Disk kosong {get_disk_free_gb():.1f}GB. Hubungi admin.")
+                await event.answer()
+                return
+
+            compatible, _, _ = await session.analyze_compatibility()
+            out_ext  = session.output_format.upper()
+
+            await self.update_status(
+                session,
+                f"**Menyiapkan merge [{out_ext}]...**\n\n"
+                f"{len(session.videos)} video  {format_size(session.get_total_size())}\n"
+                f"Masuk antrian...",
+                parse_mode='md'
+            )
+
+            async def merge_progress(pct: float, pdata: dict):
+                try:
+                    speed   = pdata.get('speed', 'N/A')
+                    timeval = pdata.get('out_time', 'N/A')
+                    mode_lbl = "Stream Copy" if compatible else "Re-encode"
+                    bar      = progress_bar(pct)
+                    cpu      = get_cpu_usage()
+                    ram      = get_available_ram_gb()
+                    text = (
+                        f"**Merging -> {out_ext}...**\n\n"
+                        f"{mode_lbl}\n"
+                        f"`{bar}` {pct:.1f}%\n"
+                        f"{timeval}  {speed}x\n\n"
+                        f"CPU {cpu:.0f}%  RAM {ram:.1f}GB bebas"
+                    )
+                    await self.update_status(session, text, parse_mode='md')
+                except Exception as e:
+                    logger.error(f"merge_progress error: {e}")
+
+            try:
+                future = await self.merge_handler.queue_merge(uid, session, merge_progress)
+                success, output_path, message, stats = await future
+
+                if success and output_path:
+                    out_size  = output_path.stat().st_size
+                    orig_size = stats.get("total_size", 0)
+                    diff      = out_size - orig_size
+                    diff_lbl  = "lebih besar" if diff > 0 else "lebih kecil" if diff < 0 else "sama"
+
+                    sub_info = ""
+                    if stats.get("has_subtitle"):
+                        sub_info = (
+                            f"\nSubtitle: {stats['sub_lang']} — {stats['sub_title']}"
+                            f"\n  {stats['sub_codec_src']} -> {stats['sub_codec_out']}"
+                        )
+
+                    caption = (
+                        f"**Merge Selesai!**\n\n"
+                        f"{len(session.videos)} video digabung\n"
+                        f"{format_duration(stats.get('total_duration', 0))}\n"
+                        f"{format_size(out_size)}\n"
+                        f"Selisih: {format_size(abs(diff))} ({diff_lbl})\n"
+                        f"Mode: {stats.get('mode', '?')}\n"
+                        f"Format: `{stats.get('output_format','mp4').upper()}`"
+                        f"{sub_info}"
+                    )
+
+                    # ── Upload progress callback ──────────────────────────
+                    ul_start    = time.time()
+                    ul_last_upd = [0.0]
+
+                    async def upload_progress(sent: int, total: int):
+                        now = time.time()
+                        if now - ul_last_upd[0] < 3:
+                            return
+                        ul_last_upd[0] = now
+                        pct    = sent / total * 100 if total else 0
+                        elap   = now - ul_start
+                        speed  = sent / elap if elap > 0 else 0
+                        remain = (total - sent) / speed if speed > 0 else 0
+                        bar    = progress_bar(pct)
+                        await self.update_status(
+                            session,
+                            f"**Mengupload [{out_ext}]...**\n\n"
+                            f"`{bar}` {pct:.1f}%\n"
+                            f"{format_size(sent)} / {format_size(total)}\n"
+                            f"Speed: {format_speed(speed)}\n"
+                            f"Sisa: {int(remain//60)}m {int(remain%60)}s\n"
+                            f"Workers: {UPLOAD_WORKERS} koneksi paralel",
+                            parse_mode='md'
+                        )
+
+                    # part_size_kb=512 adalah batas keras protokol MTProto Telegram
+                    # Kecepatan ditingkatkan lewat workers (koneksi TCP paralel)
+                    await event.client.send_file(
+                        uid,
+                        output_path,
+                        caption=caption,
+                        parse_mode='md',
+                        part_size_kb=UPLOAD_PART_SIZE_KB,
+                        workers=UPLOAD_WORKERS,
+                        supports_streaming=True,
+                        progress_callback=upload_progress,
+                    )
+
+                    ul_elapsed = time.time() - ul_start
+                    avg_spd    = out_size / ul_elapsed if ul_elapsed > 0 else 0
+                    logger.info(f"Upload selesai: {format_size(out_size)} dalam {ul_elapsed:.1f}s avg {format_speed(avg_spd)}")
+
+                    if session.status_message:
+                        try: await session.status_message.delete()
+                        except: pass
+                elif message == "CANCELLED":
+                    # User tekan /cancel — tidak perlu pesan error
+                    logger.info(f"Merge cancelled untuk user {uid}")
+                else:
+                    await self.update_status(
+                        session,
+                        f"**Merge gagal:**\n`{message[:300]}`",
+                        parse_mode='md'
+                    )
+
+            except asyncio.CancelledError:
+                logger.info(f"Merge task CancelledError untuk user {uid}")
+            except Exception as e:
+                logger.error(f"Merge/upload exception: {e}", exc_info=True)
+                if not session.cancel_flag:
+                    await self.update_status(
+                        session, f"**Error:**\n`{str(e)[:300]}`", parse_mode='md'
+                    )
+            finally:
+                session.cleanup()
+                self.merge_handler.remove_merge_task(uid)
+                self.sessions.pop(uid, None)
+
+            await event.answer()
+
+    # ── Auto cleanup ──────────────────────────────────────────────────────────
+
+    async def auto_cleanup_loop(self):
+        while True:
+            try:
+                now     = datetime.now()
+                expired = [uid for uid, s in self.sessions.items()
+                           if (now - s.created_at).total_seconds() > 7200]
+                for uid in expired:
+                    s = self.sessions.pop(uid)
+                    if s.status_message:
+                        try: await s.status_message.delete()
+                        except: pass
+                    s.cleanup()
+                if expired:
+                    logger.info(f"Auto-cleaned {len(expired)} expired sessions")
+            except Exception as e:
+                logger.error(f"auto_cleanup_loop: {e}")
+            await asyncio.sleep(3600)
+
+# ==================== MAIN ====================
+
+async def main():
+    total_ram = get_system_ram_gb()
+    preset    = get_ffmpeg_preset()
+
+    print("=" * 60)
+    print("MERGE VIDEO BOT — Subtitle + Format Pilihan + Upload Cepat")
+    print("=" * 60)
+    print(f"Max size    : {MAX_FILE_SIZE_GB} GB")
+    print(f"RAM         : {total_ram:.1f} GB  |  Preset: {preset}")
+    print(f"Concurrent  : {MAX_CONCURRENT_MERGE} user")
+    print(f"Subtitle    : tx3g/mov_text/Indonesian dipertahankan")
+    print(f"Format      : MP4 (mov_text) atau MKV (srt) — pilihan user")
+    print(f"Upload      : {UPLOAD_PART_SIZE_KB} KB/chunk x {UPLOAD_WORKERS} workers paralel")
+    print(f"Download    : {DOWNLOAD_REQUEST_SIZE//1024//1024} MB/req x {DOWNLOAD_WORKERS} workers paralel")
+    print("=" * 60)
+    print("Stream Copy jika codec sama — tanpa re-encode")
+    print("Subtitle: tx3g -> mov_text (MP4) / srt (MKV)")
+    print("Queue + RAM Guard + Auto Cleanup")
+    print("=" * 60)
+
+    # ── Auto clear semua sisa session saat startup/restart ──────────────────
+    if DOWNLOADS_DIR.exists():
+        leftover = list(DOWNLOADS_DIR.glob("user_*"))
+        if leftover:
+            print(f"  Membersihkan {len(leftover)} sisa session dari restart sebelumnya...")
+            for folder in leftover:
+                if folder.is_dir():
+                    try:
+                        shutil.rmtree(folder)
+                        print(f"  Hapus: {folder.name}")
+                    except Exception as e:
+                        print(f"  Gagal hapus {folder.name}: {e}")
+        else:
+            print("  Tidak ada sisa session lama.")
+
+    bot = TelegramBot(API_ID, API_HASH, BOT_TOKEN)
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        print("\nBot stopped by user")
+        for _, s in bot.sessions.items():
+            s.cleanup()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
