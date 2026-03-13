@@ -153,7 +153,7 @@ async def merge_video_files(list_file: Path, output_file: Path, total_duration: 
         cmd = [
             'ffmpeg', '-y', '-i', str(intermediate_file),
             '-vf', f"subtitles='{escaped_sub_path}':force_style='{hardsub_style}'", 
-            '-c:v', 'libx264', '-preset', 'fast'
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '0'
         ]
         
         if orig_bitrate > 0:
