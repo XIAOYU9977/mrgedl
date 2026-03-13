@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+asyncio
+aiohttp
+aiofiles
+python-dotenv
