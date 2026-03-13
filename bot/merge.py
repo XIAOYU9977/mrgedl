@@ -59,22 +59,32 @@ def collect_episode_files(directory: Path) -> List[Path]:
     extensions = ['.mp4', '.mkv', '.avi', '.mov']
     return [p for p in directory.iterdir() if p.suffix.lower() in extensions]
 
-def extract_episode_number(filename: str) -> int:
-    """Extract episode number from filename."""
+def extract_episode_number(text: str) -> int:
+    """Extract episode number from text (filename or caption)."""
     patterns = [
         r'[Ee]p(?:isode)?[\s._-]*(\d+)',
+        r'[Ee](\d+)',  # Support E01
         r'[Pp]art[\s._-]*(\d+)',
         r'(\d{1,4})'
     ]
     for pattern in patterns:
-        match = re.search(pattern, filename, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
              return int(match.group(1))
     return 0
 
-def sort_episode_order(files: List[Path]) -> List[Path]:
-    """Sort files based on episode numbers extracted from filenames."""
-    return sorted(files, key=lambda p: extract_episode_number(p.name))
+def sort_episode_order(file_data: List[Dict]) -> List[Path]:
+    """
+    Sort files based on episode numbers extracted from filenames and captions.
+    file_data: List of dicts, each containing 'path' (Path) and 'search_text' (str)
+    """
+    def get_sort_key(item):
+        ep_num = extract_episode_number(item['search_text'])
+        # Fallback to Path.name if no number found, though shouldn't happen often
+        return (ep_num, item['path'].name)
+
+    sorted_items = sorted(file_data, key=get_sort_key)
+    return [item['path'] for item in sorted_items]
 
 async def generate_concat_list(files: List[Path], output_list: Path):
     """Generate a text file for ffmpeg concat demuxer."""
@@ -122,7 +132,8 @@ async def merge_video_files(list_file: Path, output_file: Path, total_duration: 
         
         cmd_merge = [
             'ffmpeg', '-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0', '-i', str(list_file),
-            '-c', 'copy', '-avoid_negative_ts', 'make_zero', str(intermediate_file)
+            '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'srt', # Convert mov_text to srt for MKV intermediate
+            '-avoid_negative_ts', 'make_zero', str(intermediate_file)
         ]
         
         p1 = await asyncio.create_subprocess_exec(*cmd_merge, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
@@ -157,12 +168,25 @@ async def merge_video_files(list_file: Path, output_file: Path, total_duration: 
             '-progress', 'pipe:1', str(output_file)
         ])
     else:
-        # Softsub (Stream Copy)
+        # Softsub (Stream Copy) or No Subtitles
         cmd = [
             'ffmpeg', '-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0', '-i', str(list_file),
-            '-c', 'copy', '-avoid_negative_ts', 'make_zero',
-            '-progress', 'pipe:1', str(output_file)
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-avoid_negative_ts', 'make_zero'
         ]
+        
+        if sub_mode == "none":
+            cmd.append("-sn")
+        else:
+            # Safe subtitle conversion for containers
+            if output_format.lower() == "mkv":
+                cmd.extend(['-c:s', 'srt'])
+            else:
+                cmd.extend(['-c:s', 'mov_text'])
+            
+        cmd.extend([
+            '-progress', 'pipe:1', str(output_file)
+        ])
 
     logger.info(f"Running FFmpeg: {' '.join(cmd)}")
     

@@ -43,6 +43,9 @@ async def get_mediainfo(file_path: Path) -> str:
     """Get technical info of a video file."""
     import asyncio
     import json
+    if not file_path.exists():
+        return "❌ File tidak ditemukan untuk MediaInfo."
+        
     try:
         cmd = [
             'ffprobe', '-v', 'quiet', '-print_format', 'json',
@@ -54,17 +57,25 @@ async def get_mediainfo(file_path: Path) -> str:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await proc.communicate()
+        if not stdout:
+            return "❌ Gagal mendapatkan data ffprobe."
+            
         data = json.loads(stdout.decode())
         
         format_info = data.get('format', {})
         streams = data.get('streams', [])
         
-        v_stream = next((s for s in streams if s['codec_type'] == 'video'), {})
-        a_stream = next((s for s in streams if s['codec_type'] == 'audio'), {})
-        subs = [s for s in streams if s['codec_type'] == 'subtitle']
+        if not streams:
+            return "❌ Tidak ada stream data ditemukan di file ini."
+            
+        v_stream = next((s for s in streams if s.get('codec_type') == 'video'), {})
+        a_stream = next((s for s in streams if s.get('codec_type') == 'audio'), {})
+        subs = [s for s in streams if s.get('codec_type') == 'subtitle']
         
         # Details
-        res = f"{v_stream.get('width', 'N/A')}x{v_stream.get('height', 'N/A')}"
+        width = v_stream.get('width', 'N/A')
+        height = v_stream.get('height', 'N/A')
+        res = f"{width}x{height}" if width != 'N/A' else 'N/A'
         v_codec = v_stream.get('codec_name', 'N/A').upper()
         a_codec = a_stream.get('codec_name', 'N/A').upper()
         
@@ -75,8 +86,14 @@ async def get_mediainfo(file_path: Path) -> str:
         a_bitrate_str = f"{a_bitrate // 1000} kbps" if a_bitrate else "N/A"
         
         # Frame rate
-        fps_base = v_stream.get('r_frame_rate', '0/0').split('/')
-        fps = round(int(fps_base[0]) / int(fps_base[1]), 2) if len(fps_base) == 2 and int(fps_base[1]) != 0 else "N/A"
+        fps_val = "N/A"
+        r_frame_rate = v_stream.get('r_frame_rate', '0/0')
+        if r_frame_rate and '/' in r_frame_rate:
+            try:
+                fps_base = r_frame_rate.split('/')
+                if len(fps_base) == 2 and int(fps_base[1]) != 0:
+                    fps_val = round(int(fps_base[0]) / int(fps_base[1]), 2)
+            except: pass
         
         size = format_size(int(format_info.get('size', 0)))
         dur = format_duration(float(format_info.get('duration', 0)))
@@ -88,7 +105,7 @@ async def get_mediainfo(file_path: Path) -> str:
             f"⏳ **Duration:** {dur}\n"
             f"📏 **Resolution:** {res}\n"
             f"🎥 **Video Codec:** {v_codec}\n"
-            f"🎞 **Frame Rate:** {fps} FPS\n"
+            f"🎞 **Frame Rate:** {fps_val} FPS\n"
             f"📈 **Video Bitrate:** {v_bitrate_str}\n"
             f"🔊 **Audio Codec:** {a_codec}\n"
             f"🎵 **Audio Bitrate:** {a_bitrate_str}\n"

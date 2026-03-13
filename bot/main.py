@@ -14,7 +14,7 @@ from bot.merge import (
     get_video_duration, collect_episode_files, sort_episode_order,
     generate_concat_list, merge_video_files
 )
-from bot.cleaner import cleanup_temp_files
+from bot.cleaner import cleanup_temp_files, cleanup_all_temp_files
 
 # --- CONFIGURATION ---
 API_ID = 30653860
@@ -32,6 +32,7 @@ MAX_FILES = 200
 
 # --- BOT INITIALIZATION ---
 logger = setup_logging()
+cleanup_all_temp_files(TEMP_DIR)
 app = Client("merge_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 downloader = Downloader(app)
 
@@ -50,7 +51,8 @@ def get_session(user_id):
             "last_update": 0.0,
             "format": "mkv",
             "sub_mode": "softsub",
-            "recv_msg": None
+            "recv_msg": None,
+            "output_name": "merged_video"
         }
     return user_sessions[user_id]
 
@@ -156,11 +158,13 @@ async def cancel_cmd(client, message: Message):
     uid = message.from_user.id
     session = get_session(uid)
     
-    session["cancel"] = True
-    cleanup_temp_files(uid, TEMP_DIR)
-    user_sessions.pop(uid, None)
-    
-    await message.reply("❌ Proses dibatalkan dan file sementara telah dihapus.")
+    if session["status"] == "processing":
+        session["cancel"] = True
+        await message.reply("⛔ **Proses dibatalkan secara paksa oleh user.**\nFile sementara sedang dibersihkan...")
+    else:
+        cleanup_temp_files(uid, TEMP_DIR)
+        user_sessions.pop(uid, None)
+        await message.reply("❌ Proses dibatalkan dan file sementara telah dihapus.")
 
 @app.on_callback_query(filters.regex(r"^mi_show"))
 async def mediainfo_cb(client, cb: CallbackQuery):
@@ -199,11 +203,25 @@ async def merge_cmd(client, message: Message):
         await message.reply("Proses sedang berjalan.")
         return
 
-    # Choose Format
+    # Choose Subtitle Mode first
+    btn = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Softsub (Copy)", callback_data="sub_softsub")],
+        [InlineKeyboardButton("Hardsub (Burn)", callback_data="sub_hardsub")],
+        [InlineKeyboardButton("Tanpa Subtitle", callback_data="sub_none")]
+    ])
+    await message.reply("Pilih mode subtitle:", reply_markup=btn)
+
+@app.on_callback_query(filters.regex(r"^sub_"))
+async def sub_cb(client, cb: CallbackQuery):
+    uid = cb.from_user.id
+    session = get_session(uid)
+    mode = cb.data.split("_")[1]
+    session["sub_mode"] = mode
+    
     btn = InlineKeyboardMarkup([
         [InlineKeyboardButton("MKV", callback_data="fmt_mkv"), InlineKeyboardButton("MP4", callback_data="fmt_mp4")]
     ])
-    await message.reply("Pilih format output:", reply_markup=btn)
+    await cb.edit_message_text(f"Mode: {mode.upper()}\nPilih format output:", reply_markup=btn)
 
 @app.on_callback_query(filters.regex(r"^fmt_"))
 async def fmt_cb(client, cb: CallbackQuery):
@@ -213,19 +231,53 @@ async def fmt_cb(client, cb: CallbackQuery):
     session["format"] = fmt
     
     btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Softsub (Copy)", callback_data="sub_softsub"), InlineKeyboardButton("Hardsub (Burn)", callback_data="sub_hardsub")]
+        [InlineKeyboardButton("🚀 Start Merge", callback_data="process_start")],
+        [InlineKeyboardButton("✏️ Rename Hasil", callback_data="process_rename")]
     ])
-    await cb.edit_message_text(f"Format: {fmt.upper()}\nPilih mode subtitle:", reply_markup=btn)
+    await cb.edit_message_text(
+        f"Pilihan:\nMode: {session['sub_mode'].upper()}\nFormat: {fmt.upper()}\n"
+        f"Nama: `{session['output_name']}.{fmt}`\n\nSiap memulai?", 
+        reply_markup=btn
+    )
 
-@app.on_callback_query(filters.regex(r"^sub_"))
-async def sub_cb(client, cb: CallbackQuery):
+@app.on_callback_query(filters.regex(r"^process_"))
+async def process_cb(client, cb: CallbackQuery):
     uid = cb.from_user.id
     session = get_session(uid)
-    mode = cb.data.split("_")[1]
-    session["sub_mode"] = mode
+    action = cb.data.split("_")[1]
     
-    await cb.edit_message_text(f"Pilihan:\nFormat: {session['format'].upper()}\nMode: {mode.upper()}\n\n⏳ **Memulai proses...**")
-    asyncio.create_task(run_merge_process(uid))
+    if action == "rename":
+        session["status"] = "waiting_rename"
+        await cb.edit_message_text("📝 **Kirimkan nama file baru (tanpa ekstensi):**\nContoh: `Drakor_Ongoing_E01`")
+    else:
+        await cb.edit_message_text(f"⏳ **Memulai proses...**\nNama: `{session['output_name']}.{session['format']}`")
+        asyncio.create_task(run_merge_process(uid))
+
+@app.on_message(filters.text & filters.private)
+async def text_handler(client, message: Message):
+    uid = message.from_user.id
+    session = get_session(uid)
+    
+    if session["status"] == "waiting_rename":
+        new_name = message.text.strip().replace(" ", "_")
+        # remove extension if user included it
+        new_name = Path(new_name).stem
+        session["output_name"] = new_name
+        session["status"] = "waiting_files" # Return to normal wait
+        
+        text = (
+            f"✅ **Nama file diubah menjadi:** `{new_name}`\n"
+            f"Mode: {session['sub_mode'].upper()}\n"
+            f"Format: {session['format'].upper()}\n\n"
+            "⏳ **Memulai proses...**"
+        )
+        if session["msg"]:
+            try: await session["msg"].edit_text(text)
+            except: session["msg"] = await message.reply(text)
+        else:
+            session["msg"] = await message.reply(text)
+            
+        asyncio.create_task(run_merge_process(uid))
 
 async def run_merge_process(uid):
     session = get_session(uid)
@@ -238,7 +290,8 @@ async def run_merge_process(uid):
         # 1. DOWNLOAD
         downloaded_files = []
         for i, msg in enumerate(session["files"]):
-            if session["cancel"]: return
+            if session["cancel"]: 
+                return
             
             file_name = (msg.video.file_name if msg.video else msg.document.file_name) or f"episode_{i+1}.mp4"
             file_path = user_dir / file_name
@@ -249,21 +302,36 @@ async def run_merge_process(uid):
             await downloader.download_video(msg, file_path, progress_callback=dl_cb)
             
             if not file_path.exists() or file_path.stat().st_size == 0:
-                await app.send_message(uid, f"❌ File {file_name} gagal didownload.")
+                await app.send_message(uid, f"❌ File {file_name} gagal didownload.\nProses dihentikan.")
                 return
             downloaded_files.append(file_path)
 
-        if session["cancel"]: return
+        if session["cancel"]: 
+            return
 
         # 2. SORTING
         await update_status_msg(uid, "🔄 **Mengurutkan episode...**", force=True)
-        sorted_files = sort_episode_order(downloaded_files)
+        
+        file_sort_data = []
+        for i, path in enumerate(downloaded_files):
+            msg = session["files"][i]
+            caption = msg.caption or ""
+            search_text = f"{path.name} {caption}"
+            file_sort_data.append({"path": path, "search_text": search_text})
+            
+        sorted_files = sort_episode_order(file_sort_data)
+        
+        # Notify user of sorted list
+        file_list_text = "📋 **Urutan Episode Terdeteksi:**\n"
+        for i, f in enumerate(sorted_files):
+            file_list_text += f"{i+1}. `{f.name}`\n"
+        await app.send_message(uid, file_list_text)
         
         # 3. MERGE
         concat_list = user_dir / "list.txt"
         await generate_concat_list(sorted_files, concat_list)
         
-        output_file = user_dir / f"merged_{uid}.{session['format']}"
+        output_file = user_dir / f"{session['output_name']}.{session['format']}"
         total_duration = 0.0
         for f in sorted_files:
             total_duration += await get_video_duration(f)
@@ -278,6 +346,9 @@ async def run_merge_process(uid):
             progress_callback=merge_cb
         )
         
+        if session["cancel"]:
+            return
+
         if success and output_file.exists():
             # 4. UPLOAD
             await update_status_msg(uid, "📤 **Uploading hasil merge...**", force=True)
@@ -294,16 +365,24 @@ async def run_merge_process(uid):
             await app.send_video(
                 uid,
                 video=str(output_file),
-                caption=f"✅ Berhasil digabung!\nMode: {session['sub_mode'].upper()}\nFormat: {session['format'].upper()}",
+                caption=(
+                    f"✅ **Berhasil digabung!**\n\n"
+                    f"🎬 Ep: {len(sorted_files)} file\n"
+                    f"🛠️ Mode: {session['sub_mode'].upper()}\n"
+                    f"📦 Format: {session['format'].upper()}"
+                ),
                 progress=up_cb,
                 reply_markup=reply_markup
             )
         else:
             await app.send_message(uid, "❌ Gagal melakukan penggabungan video.")
 
+    except asyncio.CancelledError:
+        logger.info(f"Process cancelled for user {uid}")
+        await app.send_message(uid, "⛔ **Proses dibatalkan.**")
     except Exception as e:
         logger.error(f"Error in merge process for user {uid}: {e}", exc_info=True)
-        await app.send_message(uid, f"❌ Kesalahan: {str(e)}")
+        await app.send_message(uid, f"❌ **Bot mengalami kesalahan fatal!**\nKesalahan: `{str(e)}`\n\nBot akan mencoba memulihkan diri (restart).")
     finally:
         cleanup_temp_files(uid, TEMP_DIR)
         user_sessions.pop(uid, None)
