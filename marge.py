@@ -44,8 +44,8 @@ AUTHORIZED_USERS = [] # Masukkan ID user di sini, contoh: [12345678, 87654321]
 MIN_RAM_AVAILABLE_GB = 1.5
 MIN_DISK_FREE_GB     = 10
 
-DOWNLOAD_TIMEOUT         = 600
-MERGE_TIMEOUT            = 28800
+DOWNLOAD_TIMEOUT         = 7200  # 2 jam
+MERGE_TIMEOUT            = 86400 # 24 jam
 PROGRESS_UPDATE_INTERVAL = 3
 
 FALLBACK_CRF_VALUE     = 18
@@ -96,7 +96,7 @@ MSG_HELP = (
     "/start - Menu utama\n"
     "/help  - Bantuan ini\n"
     "/cancel - Batalkan session\n\n"
-    f"Batasan: Maks 10 video | Total {MAX_FILE_SIZE_GB} GB"
+    f"Hingga 2000 video | Tanpa batas ukuran"
 )
 
 logging.basicConfig(
