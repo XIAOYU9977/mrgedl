@@ -811,19 +811,18 @@ class TelegramBot:
     # ── Status helper ─────────────────────────────────────────────────────────
 
     async def update_status(self, session: MergeSession, text: str,
-                             buttons=None, parse_mode: str = 'md', force_repost: bool = False):
+                             buttons=None, parse_mode: str = 'md', force_repost: bool = True):
         try:
-            if session.status_message and not force_repost:
+            # Jika repost: hapus yang lama (opsional) lalu kirim baru
+            if force_repost and session.status_message:
+                try: await session.status_message.delete()
+                except: pass
+            elif session.status_message:
                 try:
                     await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
                     return
                 except Exception:
                     pass
-            
-            # Jika repost: hapus yang lama (opsional) lalu kirim baru
-            if force_repost and session.status_message:
-                try: await session.status_message.delete()
-                except: pass
 
             session.status_message = await self.client.send_message(
                 session.user_id, text, buttons=buttons, parse_mode=parse_mode
@@ -913,7 +912,7 @@ class TelegramBot:
             )
         else:
             # Repost agar di paling bawah setelah file diterima
-            await self.update_status(session, "**Mempersiapkan download...**", force_repost=True)
+            await self.update_status(session, "**Mempersiapkan download...**")
 
         start_time = time.time()
         last_upd   = [time.time()]
@@ -1322,8 +1321,7 @@ class TelegramBot:
                 f"**Menyiapkan merge [{out_ext}]...**\n\n"
                 f"{len(session.videos)} video  {format_size(session.get_total_size())}\n"
                 f"Masuk antrian...",
-                parse_mode='md',
-                force_repost=True
+                parse_mode='md'
             )
 
             async def merge_progress(pct: float, pdata: dict):
