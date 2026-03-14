@@ -360,18 +360,24 @@ class MergeSession:
         self.incoming_messages:   List[int] = []
         self.active_downloads:    Dict[int, Dict] = {} # msg_id -> {name, received, total, speed}
         
+        # ── Sequential Queue ──────────────────────────────────────────────
+        self.download_queue = asyncio.Queue()
+        self.download_worker_task = None
+        
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def get_download_status(self) -> str:
         """Bangun teks status minimalist sesuai permintaan user."""
         n_active = len(self.active_downloads)
+        n_queued = self.download_queue.qsize()
         n_done = len(self.videos)
-        total = n_active + n_done
+        total = n_active + n_done + n_queued
         
-        if n_active == 0:
+        if n_active == 0 and n_queued == 0:
             return f"✅ **File selesai diupload {n_done}/{n_done}**"
             
-        return f"📥 **File diterima {n_done}/{total}**\n(Sedang memproses {n_active} file...)"
+        queued_info = f"\n(Antrian: {n_queued} file)" if n_queued > 0 else ""
+        return f"📥 **File diterima {n_done}/{total}**\n(Sedang memproses download...){queued_info}"
 
     async def request_cancel(self):
         """Tandai session untuk dibatalkan secara paksa."""
@@ -960,22 +966,6 @@ class TelegramBot:
                 self.sessions[uid].incoming_messages.append(msg.id)
             return
             
-        # Track all incoming video messages for this user
-        if uid in self.sessions:
-            session = self.sessions[uid]
-            session.user_video_messages.append(event.message.id)
-            
-        file      = event.message.file
-        file_size = file.size
-        file_name = file.name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-
-        if file_size > MAX_FILE_SIZE_BYTES:
-            await self.update_status(
-                session,
-                f"**File terlalu besar!**\n{file_name}\n{format_size(file_size)}\nBatas: {format_size(MAX_FILE_SIZE_BYTES)}"
-            )
-            return
-
         if uid not in self.sessions:
             sd = DOWNLOADS_DIR / f"user_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             self.sessions[uid] = MergeSession(uid, sd)
@@ -983,7 +973,44 @@ class TelegramBot:
             self.sessions[uid].user_video_messages.append(event.message.id)
         
         session = self.sessions[uid]
+        
+        # Masukkan ke antrian untuk download satu per satu
+        await session.download_queue.put(event)
+        
+        if not session.download_worker_task or session.download_worker_task.done():
+            session.download_worker_task = asyncio.create_task(self.download_worker(session))
+
+    async def download_worker(self, session: MergeSession):
+        """Worker background untuk memproses download satu per satu."""
+        try:
+            while not session.cancel_flag:
+                try:
+                    # Tunggu event download baru (timeout singkat untuk cek cancel_flag)
+                    event = await asyncio.wait_for(session.download_queue.get(), timeout=2)
+                except asyncio.TimeoutError:
+                    if session.is_processing or session.videos:
+                        # Jika sudah tidak ada di queue tapi sedang di-merge, tetap biarkan worker
+                        continue
+                    break # Cleanup worker jika lama idle
+                
+                await self.process_video_download(session, event)
+                session.download_queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"download_worker error: {e}")
+
+    async def process_video_download(self, session: MergeSession, event):
+        """Logika asli video_handler dipindahkan ke sini."""
+        uid = session.user_id
         msg_id = event.message.id
+        file = event.message.file
+        file_size = file.size
+        file_name = file.name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+
+        # Track all incoming video messages for this user
+        session.user_video_messages.append(event.message.id)
+
         session.active_downloads[msg_id] = {
             "name": file_name,
             "received": 0,
