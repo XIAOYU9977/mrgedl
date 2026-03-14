@@ -20,20 +20,43 @@ def get_safe_percentage(current, total):
 def get_episode_number(filename):
     """
     Extract episode number from filename.
-    Matches: E01, Episode 1, 01, etc.
+    Supports: E01, Ep01, Ep 01, Episode 01, S01E01, etc.
     """
-    # Patterns to look for
+    # Remove file extension to avoid matching numbers in it
+    name, _ = os.path.splitext(filename)
+    
+    # Priority patterns
     patterns = [
-        r'E(\d+)',            # E01
-        r'Episode\s*(\d+)',   # Episode 01
-        r'(\d+)'              # 01
+        r'S\d+E(\d+)',         # S01E01
+        r'Episode\s*(\d+)',    # Episode 01
+        r'Ep\s*(\d+)',         # Ep 01, Ep01
+        r'[Ee](\d+)',          # E01, e01
+        r'#\s*(\d+)',          # #01, # 01
+        r'\[(\d+)\]',          # [01]
+        r'\((\d+)\)',          # (01)
+        r'-\s*(\d+)\s*-',      # - 01 -
+        r'\b0*(\d+)\b'          # Any standalone number (fallback)
     ]
     
     for pattern in patterns:
-        match = re.search(pattern, filename, re.IGNORECASE)
+        match = re.search(pattern, name, re.IGNORECASE)
         if match:
-            return int(match.group(1))
-    return 999  # Default high number if not found
+            try:
+                num = int(match.group(1))
+                if 1 <= num <= 1000:
+                    return num
+            except ValueError:
+                continue
+    
+    # Last resort: find any digits
+    digits = re.findall(r'\d+', name)
+    if digits:
+        for d in reversed(digits): # Often episode is towards the end
+             num = int(d)
+             if 1 <= num <= 1000:
+                 return num
+
+    return 9999  # Default high number for files without clear numbering
 
 def sort_episodes(file_list):
     """Sorts a list of files based on extracted episode number."""

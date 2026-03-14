@@ -31,6 +31,7 @@ class UserSession(TypedDict, total=False):
     audio_bitrate: str
     preset: str
     crf: str
+    last_msg_id: Optional[int]
 
 user_sessions: Dict[int, UserSession] = {}
 
@@ -46,7 +47,8 @@ def get_session(user_id: int) -> UserSession:
             "audio_encoder": "Default",
             "audio_bitrate": "Default",
             "preset": "Default",
-            "crf": "Default"
+            "crf": "Default",
+            "last_msg_id": None
         })
     return user_sessions[user_id]
 
@@ -306,12 +308,31 @@ async def file_handler(client, message):
             file_list_text = "\n".join([f"{i+1}. {os.path.basename(str(f))}" for i, f in enumerate(user_files)])
             
             response = (
-                f"✅ **Episode diterima:**\n\n"
-                f"{file_list_text}\n\n"
-                f"**Total:** {len(user_files)}\n\n"
+                f"📥 **File diterima:** `{len(user_files)}` file terdeteksi.\n"
+                f"**Total:** {len(user_files)} file dalam antrian.\n\n"
                 f"Ketik /merge untuk mulai atau /cancel untuk reset."
             )
-            await status_msg.edit_text(response)
+            
+            if session.get("last_msg_id"):
+                try:
+                    await client.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=session["last_msg_id"],
+                        text=response
+                    )
+                except Exception:
+                    # If edit fails (e.g. message too old or deleted), send new
+                    new_msg = await message.reply_text(response)
+                    session["last_msg_id"] = new_msg.id
+            else:
+                new_msg = await message.reply_text(response)
+                session["last_msg_id"] = new_msg.id
+                
+            # Delete the "Mendownload file..." temp message
+            try:
+                await status_msg.delete()
+            except:
+                pass
         except asyncio.CancelledError:
             logger.info(f"Download task for user {user_id} was cancelled.")
             await status_msg.edit_text("❌ Download dibatalkan.")
@@ -382,11 +403,17 @@ async def merge_handler(client, message):
             await client.send_video(
                 chat_id=message.chat.id,
                 video=output_path,
-                caption=f"✅ **Merge Berhasil!**\n\nMode: {'Softsub' if mode == 1 else 'Hardsub'}\nTotal Episode: {len(user_files)}",
+                caption=f"✅ **Proses Selesai!**\n\nMode: {'Softsub' if mode == 1 else 'Hardsub'}\nTotal: {len(user_files)} Episode",
                 supports_streaming=True
             )
             
-            await status_msg.delete()
+            # Update status message to done
+            try:
+                await status_msg.edit_text(f"✅ **Selesai!** {len(user_files)}/{len(user_files)} file berhasil digabung.")
+            except:
+                pass
+            
+            session["last_msg_id"] = None # Reset for next process
             cleanup_temp_files(user_id)
             session["files"] = []
         except asyncio.CancelledError:

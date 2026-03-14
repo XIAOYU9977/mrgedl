@@ -146,14 +146,20 @@ async def merge_video_files(file_list, user_id, mode, message, settings=None):
                 
                 # Fallback if duration is unknown
                 if total_seconds <= 0:
-                    progress_text = f"Merging... (processed {current_seconds}s)"
+                    progress_text = f"🔄 **Memproses...** (Selesai {current_seconds}s)"
                 else:
-                    bar = "█" * int(percentage / 10) + "░" * (10 - int(percentage / 10))
-                    progress_text = f"**Merging Videos...**\n`[{bar}]` {percentage:.2f}%"
+                    bar_len = 10
+                    filled_len = int(percentage / (100 / bar_len))
+                    bar = "█" * filled_len + "░" * (bar_len - filled_len)
+                    progress_text = (
+                        f"⚙️ **Sedang Menggabungkan...**\n"
+                        f"`[{bar}]` {percentage:.1f}%\n"
+                        f"⏱️ **Waktu:** {current_seconds}s / {total_seconds}s"
+                    )
                 
                 try:
                     await message.edit(progress_text)
-                except:
+                except Exception:
                     pass
     finally:
         if user_id in active_processes:
