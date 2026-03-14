@@ -1067,8 +1067,9 @@ class TelegramBot:
                 sub_info  = f"\nSubtitle: {len(subs)} stream  best: {lang_str} ({codec_str})"
 
             n = len(session.videos)
-            # Mulai loop update otomatis setelah download selesai
-            await self.start_status_refresh_loop(session)
+            # Mulai loop update otomatis HANYA jika semua download aktif sudah selesai
+            if not session.active_downloads:
+                await self.start_status_refresh_loop(session)
             
         except asyncio.CancelledError:
             logger.info(f"Download cancelled untuk user {uid}")
@@ -1078,6 +1079,10 @@ class TelegramBot:
             logger.error(f"Download error: {e}", exc_info=True)
             if not session.cancel_flag:
                 await self.update_status(session, f"**Gagal download:**\n`{str(e)[:200]}`", parse_mode='md')
+            
+            # Jika ini tadinya download terakhir, tetep coba start loop untuk tunjukkan menu
+            if not session.active_downloads:
+                await self.start_status_refresh_loop(session)
 
     # ── Summary ───────────────────────────────────────────────────────────────
 
