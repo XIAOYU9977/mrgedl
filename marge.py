@@ -1026,13 +1026,15 @@ class TelegramBot:
             return
 
         async with session.status_lock:
+            # Tentukan status awal segera (File diterima X/Y)
+            status_text = session.get_download_status()
+            
             if not session.status_message:
                 session.status_message = await self.client.send_message(
-                    uid, "📥 **Mulai menerima file...**", parse_mode='md'
+                    uid, status_text, parse_mode='md'
                 )
             else:
-                # Update status segera (File diterima X/Y)
-                await self.update_status(session, session.get_download_status())
+                await self.update_status(session, status_text)
 
         start_time = time.time()
         last_upd   = [time.time()]
