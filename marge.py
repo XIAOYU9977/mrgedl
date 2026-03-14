@@ -20,7 +20,7 @@ load_dotenv() # Load environment variables from .env file
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, MessageNotModifiedError
 from telethon import helpers
 
 # ==================== CONFIGURASI ====================
@@ -141,16 +141,39 @@ def progress_bar(pct: float, length: int = 16) -> str:
     return chr(9608) * filled + chr(9617) * (length - filled)
 
 def extract_episode_number(filename: str) -> int:
-    for p in [
-        r'[Ee]p(?:isode)?[\s._-]*(\d+)',
-        r'[Pp]art[\s._-]*(\d+)',
-        r'(\d+)[\s._-]*[Oo]f',
-        r'\[(\d+)\]',
-        r'(\d{1,4})'
-    ]:
-        m = re.search(p, filename)
-        if m:
-            return int(m.group(1))
+    """
+    Extract episode number with improved logic.
+    """
+    name = Path(filename).stem
+    patterns = [
+        r'S\d+E(\d+)',         # S01E01
+        r'Episode\s*(\d+)',    # Episode 01
+        r'Ep\s*(\d+)',         # Ep 01, Ep01
+        r'[Ee](\d+)',          # E01, e01
+        r'#\s*(\d+)',          # #01, # 01
+        r'\[(\d+)\]',          # [01]
+        r'\((\d+)\)',          # (01)
+        r'-\s*(\d+)\s*-',      # - 01 -
+        r'\b0*(\d+)\b'          # Any standalone number (fallback)
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, name, re.IGNORECASE)
+        if match:
+            try:
+                num = int(match.group(1))
+                if 1 <= num <= 1000:
+                    return num
+            except ValueError:
+                continue
+    
+    # Last resort: find any digits
+    digits = re.findall(r'\d+', name)
+    if digits:
+        for d in reversed(digits):
+             num = int(d)
+             if 1 <= num <= 1000:
+                 return num
     return 0
 
 def clean_filename(filename: str) -> str:
@@ -876,8 +899,11 @@ class TelegramBot:
                 try:
                     await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
                     return
+                except MessageNotModifiedError:
+                    # Teks sama, tidak perlu kirim baru
+                    return
                 except Exception:
-                    # Edit gagal (misal pesan dihapus user), kirim baru
+                    # Edit gagal lainnya, kirim baru di bawah
                     pass
 
             # Kirim pesan baru sebagai singleton
@@ -984,12 +1010,14 @@ class TelegramBot:
             return
 
         async with session.status_lock:
+            # Atomic session creation already handled by dict check,
+            # but we use lock to avoid double status message creation.
             if not session.status_message:
                 session.status_message = await self.client.send_message(
                     uid, "**Mempersiapkan download...**", parse_mode='md'
                 )
             else:
-                # Edit existing status message instead of resending
+                # Update but don't spam if text is identical (handled in update_status)
                 await self.update_status(session, "**Mempersiapkan download...**", force_repost=False)
 
         start_time = time.time()
