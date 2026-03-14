@@ -35,7 +35,7 @@ FFPROBE_PATH  = "ffprobe"
 
 DOWNLOADS_DIR.mkdir(exist_ok=True, parents=True)
 
-MAX_FILE_SIZE_GB    = 5
+MAX_FILE_SIZE_GB    = 1000 # Unlimited for practical purposes
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_GB * 1024 * 1024 * 1024
 MAX_CONCURRENT_MERGE = 2
 # Daftar ID user yang diizinkan (kosongkan jika untuk publik)
@@ -63,21 +63,21 @@ DOWNLOAD_WORKERS      = 32               # Ultra veryfast download
 SUBTITLE_LANG_PRIORITY = ["id", "ind", "indonesian", "indonesia", "en", "eng", "english"]
 
 MSG_START = (
-    "🎬 **Merge Video Bot (UP TO 5GB!)**\n\n"
-    "Kirim beberapa video, saya gabungkan jadi satu file.\n\n"
+    "🎬 **Merge Video Bot (Tanpa Batas!)**\n\n"
+    "Kirim banyak video, saya gabungkan jadi satu file.\n\n"
     "**Fitur:**\n"
-    "- File hingga 5GB\n"
+    "- File Tanpa Batas (Unlimited)\n"
     "- Stream copy tanpa re-encode jika codec sama\n"
     "- Pilih format: MP4 atau MKV\n"
     "- Soft subtitle tx3g/Indonesian dipertahankan\n"
     f"- Antrian pintar, maks {MAX_CONCURRENT_MERGE} user bersamaan\n"
     "- Upload paralel lebih cepat\n\n"
     "**Cara pakai:**\n"
-    "1. Kirim video (boleh beberapa kali)\n"
+    "1. Kirim video (boleh banyak kali)\n"
     "2. Klik Lihat Detail\n"
     "3. Pilih format output (MP4 atau MKV)\n"
     "4. Klik Merge\n\n"
-    f"Maksimal 10 video | Total maks {MAX_FILE_SIZE_GB} GB"
+    "Hingga 2000 video | Tanpa batas ukuran"
 )
 
 MSG_HELP = (
@@ -162,7 +162,7 @@ def extract_episode_number(filename: str) -> int:
         if match:
             try:
                 num = int(match.group(1))
-                if 1 <= num <= 1000:
+                if 1 <= num <= 2000:
                     return num
             except ValueError:
                 continue
@@ -172,7 +172,7 @@ def extract_episode_number(filename: str) -> int:
     if digits:
         for d in reversed(digits):
              num = int(d)
-             if 1 <= num <= 1000:
+             if 1 <= num <= 2000:
                  return num
     return 0
 
@@ -412,7 +412,7 @@ class MergeSession:
             logger.info(f"Status loop stopped untuk user {self.user_id}")
 
     async def add_video(self, fp: Path, fn: str, fs: int) -> bool:
-        if len(self.videos) >= 10:
+        if len(self.videos) >= 2000:
             return False
         self.videos.append((fp, fn, fs))
         self.videos_info.append(await get_video_info(fp))

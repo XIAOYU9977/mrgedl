@@ -43,7 +43,7 @@ def get_episode_number(filename):
         if match:
             try:
                 num = int(match.group(1))
-                if 1 <= num <= 1000:
+                if 1 <= num <= 2000:
                     return num
             except ValueError:
                 continue
@@ -53,7 +53,7 @@ def get_episode_number(filename):
     if digits:
         for d in reversed(digits): # Often episode is towards the end
              num = int(d)
-             if 1 <= num <= 1000:
+             if 1 <= num <= 2000:
                  return num
 
     return 9999  # Default high number for files without clear numbering
