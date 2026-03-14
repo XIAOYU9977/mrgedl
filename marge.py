@@ -11,9 +11,12 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 import aiofiles
+from dotenv import load_dotenv
+
+load_dotenv() # Load environment variables from .env file
 
 # ==================== INSTALL ====================
-# pip install telethon aiofiles psutil
+# pip install telethon aiofiles psutil python-dotenv
 
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
@@ -21,9 +24,9 @@ from telethon.errors import SessionPasswordNeededError
 from telethon import helpers
 
 # ==================== CONFIGURASI ====================
-API_ID    = 30653860
-API_HASH  = "98e0a87077d4fc642ce183dfd7f46a19"
-BOT_TOKEN = "8670555448:AAHz85JOrOjwyY_V10NvbHB_Fipx5qGuy9Y"
+API_ID    = int(os.getenv("API_ID", "0"))
+API_HASH  = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 BASE_DIR      = Path(__file__).parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
@@ -52,7 +55,7 @@ UPLOAD_WORKERS      = 15   # 15 koneksi paralel TCP
 
 # Download paralel
 DOWNLOAD_REQUEST_SIZE = 1 * 1024 * 1024   # 1 MB per request
-DOWNLOAD_WORKERS      = 15
+DOWNLOAD_WORKERS      = 4                # Dikurangi untuk stabilitas
 
 # Prioritas bahasa subtitle
 SUBTITLE_LANG_PRIORITY = ["id", "ind", "indonesian", "indonesia", "en", "eng", "english"]
@@ -314,6 +317,18 @@ class MergeSession:
         self.cancel_flag    = False          # set True → hentikan semua proses
         self.ffmpeg_process = None           # referensi proses FFmpeg aktif
         self.download_task  = None           # referensi asyncio task download aktif
+        
+        # --- Encoding Settings ---
+        self.video_encoder = "Default"
+        self.video_bitrate = "Default"
+        self.audio_encoder = "Default"
+        self.audio_bitrate = "Default"
+        self.crf           = "Default"
+        self.preset        = "Default"
+        self.subtitle_type = "Softsub"       # Softsub atau Hardsub
+        
+        self.status_loop_task = None        # referensi task update status berkala
+        
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def request_cancel(self):
@@ -330,6 +345,16 @@ class MergeSession:
         if self.download_task is not None and not self.download_task.done():
             self.download_task.cancel()
             logger.info(f"Download task cancelled untuk user {self.user_id}")
+            
+        # Hentikan loop status update jika ada
+        self.stop_status_loop()
+
+    def stop_status_loop(self):
+        """Hentikan task update status berkala."""
+        if self.status_loop_task is not None and not self.status_loop_task.done():
+            self.status_loop_task.cancel()
+            self.status_loop_task = None
+            logger.info(f"Status loop stopped untuk user {self.user_id}")
 
     async def add_video(self, fp: Path, fn: str, fs: int) -> bool:
         if len(self.videos) >= 10:
@@ -365,6 +390,7 @@ class MergeSession:
         return result
 
     def cleanup(self):
+        self.stop_status_loop()
         try:
             if self.session_dir.exists():
                 shutil.rmtree(self.session_dir)
@@ -481,26 +507,53 @@ class MergeHandler:
             if has_subs:
                 cmd += ["-map", "0:s?"]
 
-            if compatible:
+            if compatible and session.video_encoder == "Default" and session.video_bitrate == "Default" and session.subtitle_type == "Softsub":
                 # Stream copy video & audio
                 cmd += ["-c:v", "copy", "-c:a", "copy"]
                 mode = "Stream Copy (Tanpa Re-Encode)"
             else:
-                # Re-encode
-                cmd += [
-                    "-c:v", "libx264", "-preset", preset, "-crf", str(FALLBACK_CRF_VALUE),
-                    "-c:a", "aac", "-b:a", FALLBACK_AUDIO_BITRATE,
-                ]
-                mode = f"Re-encode (CRF {FALLBACK_CRF_VALUE}, Preset {preset}) — {compat_msg}"
+                # Re-encode with User Settings (Hardsub REQUIRES re-encode)
+                v_enc = session.video_encoder if session.video_encoder != "Default" else "libx264"
+                a_enc = session.audio_encoder if session.audio_encoder != "Default" else "aac"
+                v_pre = session.preset if session.preset != "Default" else preset
+                v_crf = session.crf if session.crf != "Default" else str(FALLBACK_CRF_VALUE)
+                
+                cmd += ["-c:v", v_enc, "-preset", v_pre, "-crf", v_crf]
+                
+                # Hardsub Filter
+                if session.subtitle_type == "Hardsub" and has_subs:
+                    # Gunakan stream subtitle pertama untuk dibakar
+                    # FFmpeg subtitles filter butuh path yang di-escape untuk Windows
+                    escaped_path = str(list_file).replace("\\", "/").replace(":", "\\:")
+                    cmd += ["-vf", f"subtitles='{escaped_path}':si=0"]
+                    mode = f"Hardsub Encode ({v_enc}, {v_pre}, CRF {v_crf})"
+                else:
+                    mode = f"Re-encode ({v_enc}, {v_pre}, CRF {v_crf})"
+                
+                if session.video_bitrate != "Default":
+                    cmd += ["-b:v", session.video_bitrate]
+                
+                cmd += ["-c:a", a_enc]
+                if session.audio_bitrate != "Default":
+                    cmd += ["-b:a", session.audio_bitrate]
+                else:
+                    cmd += ["-b:a", FALLBACK_AUDIO_BITRATE]
+                
+                mode = f"Re-encode ({v_enc}, {v_pre}, CRF {v_crf})"
+                if not compatible:
+                    mode += f" — {compat_msg}"
 
-            # Subtitle: konversi tx3g/any -> mov_text atau srt
-            if has_subs:
+            # Subtitle Softsub: konversi tx3g/any -> mov_text atau srt
+            if has_subs and session.subtitle_type == "Softsub":
                 cmd += [
                     "-c:s", sub_codec_out,
                     "-metadata:s:s:0", f"language={sub_lang}",
                     "-metadata:s:s:0", f"title={sub_title}",
                     "-disposition:s:0", "default",
                 ]
+            elif has_subs and session.subtitle_type == "Hardsub":
+                # Jangan sertakan stream subtitle jika sudah di-hardsub
+                pass
 
             if out_ext == "mp4":
                 cmd += ["-movflags", "+faststart"]
@@ -618,14 +671,15 @@ class TelegramBot:
         self.merge_handler = MergeHandler()
 
     async def start(self):
-        self.client = TelegramClient('bot_session', self.api_id, self.api_hash)
+        # Gunakan nama session yang lebih unik untuk menghindari 'bentrok'
+        self.client = TelegramClient('merge_bot_v2_session', self.api_id, self.api_hash)
         await self.client.start(bot_token=self.bot_token)
 
         # incoming=True: hanya proses pesan masuk (bukan yang dikirim bot sendiri)
         # pattern pakai regex agar match /start, /start@botname, dll
         self.client.add_event_handler(
             self.cmd_start,
-            events.NewMessage(pattern=r'^/start', incoming=True)
+            events.NewMessage(pattern=r'^/(start|setup)', incoming=True)
         )
         self.client.add_event_handler(
             self.cmd_help,
@@ -642,12 +696,15 @@ class TelegramBot:
                 func=lambda e: (
                     e.message is not None
                     and e.message.file is not None
-                    and getattr(e.message.file, 'mime_type', '') is not None
-                    and getattr(e.message.file, 'mime_type', '').startswith('video/')
+                    and (
+                        (getattr(e.message.file, 'mime_type', '') or '').startswith('video/')
+                        or (getattr(e.message.file, 'name', '') or '').lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'))
+                    )
                 )
             )
         )
         self.client.add_event_handler(self.callback_handler, events.CallbackQuery())
+        self.client.add_event_handler(self.debug_handler, events.NewMessage(incoming=True))
 
         me = await self.client.get_me()
         logger.info(f"Bot started! @{me.username} (id={me.id})")
@@ -657,12 +714,57 @@ class TelegramBot:
     # ── Commands ──────────────────────────────────────────────────────────────
 
     async def cmd_start(self, event):
+        uid = event.sender_id
+        if uid not in self.sessions:
+            sd = DOWNLOADS_DIR / f"user_{uid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.sessions[uid] = MergeSession(uid, sd)
+            logger.info(f"New session created for user {uid} at {sd}")
+        
+        session = self.sessions[uid]
+        text = (
+            "👋 **Selamat datang di BOT MERGE VIDEO!**\n\n"
+            "Kirim video yang ingin digabung.\n\n"
+            "📌 **Silahkan pilih menu encoding anda !**\n\n"
+            f"• Video Encoder: `{session.video_encoder}`\n"
+            f"• Video Bitrate: `{session.video_bitrate}`\n"
+            f"• Audio Encoder: `{session.audio_encoder}`\n"
+            f"• Audio Bitrate: `{session.audio_bitrate}`\n"
+            f"• CRF: `{session.crf}`\n"
+            f"• Preset: `{session.preset}`\n\n"
+            "Timeout: 2 jam"
+        )
+        buttons = [
+            [Button.inline("⚙️ Settings Encoding", b"config_main")],
+            [Button.inline("📁 Mulai Kirim File", b"close_menu")]
+        ]
         try:
-            await event.reply(MSG_START, parse_mode='md')
+            await event.reply(text, buttons=buttons, parse_mode='md')
         except Exception as e:
             logger.error(f"cmd_start error: {e}")
-            # Fallback tanpa markdown jika parse gagal
-            await event.reply("Merge Video Bot\n\nKirim video untuk mulai. Gunakan /help untuk bantuan.")
+            await event.reply("Selamat datang! Gunakan /settings untuk konfigurasi encoding.")
+
+    async def show_config_main(self, uid):
+        session = self.sessions.get(uid)
+        if not session: return
+        text = (
+            "📌 **Menu Konfigurasi Encoding**\n\n"
+            f"• Video Encoder: `{session.video_encoder}`\n"
+            f"• Video Bitrate: `{session.video_bitrate}`\n"
+            f"• Audio Encoder: `{session.audio_encoder}`\n"
+            f"• Audio Bitrate: `{session.audio_bitrate}`\n"
+            f"• CRF: `{session.crf}`\n"
+            f"• Preset: `{session.preset}`\n"
+            f"• Format: `{session.output_format.upper()}`\n"
+            f"• Mode Sub: `{session.subtitle_type}`"
+        )
+        buttons = [
+            [Button.inline("Video Encoder", b"conf_v_enc"), Button.inline("Video Bitrate", b"conf_v_bit")],
+            [Button.inline("Audio Encoder", b"conf_a_enc"), Button.inline("Audio Bitrate", b"conf_a_bit")],
+            [Button.inline("CRF", b"conf_crf"), Button.inline("Preset", b"conf_preset")],
+            [Button.inline("Output Format", b"conf_out_fmt"), Button.inline("Subtitle Mode", b"conf_sub_type")],
+            [Button.inline("⬅️ Kembali", b"cmd_start")]
+        ]
+        await self.update_status(session, text, buttons=buttons, parse_mode='md')
 
     async def cmd_help(self, event):
         try:
@@ -709,19 +811,69 @@ class TelegramBot:
     # ── Status helper ─────────────────────────────────────────────────────────
 
     async def update_status(self, session: MergeSession, text: str,
-                             buttons=None, parse_mode: str = 'md'):
+                             buttons=None, parse_mode: str = 'md', force_repost: bool = False):
         try:
-            if session.status_message:
+            if session.status_message and not force_repost:
                 try:
                     await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
                     return
                 except Exception:
                     pass
+            
+            # Jika repost: hapus yang lama (opsional) lalu kirim baru
+            if force_repost and session.status_message:
+                try: await session.status_message.delete()
+                except: pass
+
             session.status_message = await self.client.send_message(
                 session.user_id, text, buttons=buttons, parse_mode=parse_mode
             )
         except Exception as e:
             logger.error(f"update_status error: {e}")
+
+    async def start_status_refresh_loop(self, session: MergeSession):
+        """Task background untuk update status message secara berkala."""
+        session.stop_status_loop() # Pastikan tidak ada loop ganda
+        
+        async def _loop():
+            try:
+                while not session.cancel_flag and not session.is_processing:
+                    # Update info real-time
+                    cpu = get_cpu_usage()
+                    ram = get_available_ram_gb()
+                    total_ram = get_system_ram_gb()
+                    disk = get_disk_free_gb()
+                    
+                    n = len(session.videos)
+                    total_dur = format_duration(session.get_total_duration())
+                    total_size = format_size(session.get_total_size())
+                    
+                    text = (
+                        "🔄 **Bot Update - Live Session Status**\n\n"
+                        f"📊 **Statistik Server:**\n"
+                        f"• CPU: `{cpu:.1f}%`    • RAM: `{ram:.1f}/{total_ram:.1f} GB` Bebas\n"
+                        f"• Disk: `{disk:.1f} GB` Bebas\n\n"
+                        f"📁 **Data Project:**\n"
+                        f"• Jumlah Video: `{n}`\n"
+                        f"• Total Durasi: `{total_dur}`\n"
+                        f"• Total Ukuran: `{total_size}`\n\n"
+                        "💡 Kirim video lagi atau gunakan menu di bawah untuk lanjut."
+                    )
+                    
+                    buttons = [
+                        [Button.inline("⚙️ Settings Encoding", b"config_main")],
+                        [Button.inline("🔍 Lihat Detail & Merge", b"show_summary")],
+                        [Button.inline("❌ Batal", b"cancel")]
+                    ]
+                    
+                    await self.update_status(session, text, buttons=buttons, parse_mode='md')
+                    await asyncio.sleep(10) # Refresh setiap 10 detik
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"status_refresh_loop error: {e}")
+
+        session.status_loop_task = asyncio.create_task(_loop())
 
     # ── Video handler ─────────────────────────────────────────────────────────
 
@@ -756,9 +908,12 @@ class TelegramBot:
             return
 
         if not session.status_message:
-            session.status_message = await event.reply(
-                f"**Mempersiapkan download...**", parse_mode='md'
+            session.status_message = await self.client.send_message(
+                uid, "**Mempersiapkan download...**", parse_mode='md'
             )
+        else:
+            # Repost agar di paling bawah setelah file diterima
+            await self.update_status(session, "**Mempersiapkan download...**", force_repost=True)
 
         start_time = time.time()
         last_upd   = [time.time()]
@@ -794,6 +949,7 @@ class TelegramBot:
 
             async def _run_download():
                 async with aiofiles.open(file_path, 'wb') as f_out:
+                    logger.info(f"Download started for {file_name} (Size: {file_size})")
                     async for chunk in event.client.iter_download(
                         event.message.media,
                         request_size=DOWNLOAD_REQUEST_SIZE,
@@ -805,6 +961,11 @@ class TelegramBot:
                             raise asyncio.CancelledError("Download dibatalkan oleh user")
                         await f_out.write(chunk)
                         dl_received[0] += len(chunk)
+                        
+                        # Debug: log every 10MB
+                        if dl_received[0] % (10 * 1024 * 1024) < len(chunk):
+                            logger.info(f"Downloading {file_name}: {format_size(dl_received[0])} / {format_size(dl_total)}")
+                            
                         await dl_progress(dl_received[0], dl_total)
 
             dl_task = asyncio.create_task(
@@ -831,20 +992,9 @@ class TelegramBot:
                 sub_info  = f"\nSubtitle: {len(subs)} stream  best: {lang_str} ({codec_str})"
 
             n = len(session.videos)
-            await self.update_status(
-                session,
-                f"**Download #{n} Selesai!**\n\n"
-                f"`{file_name[:40]}`\n"
-                f"{format_size(dl_size)}"
-                f"{sub_info}\n\n"
-                f"{n}/10 video  Total: {format_size(session.get_total_size())}\n\n"
-                f"Kirim video lagi atau klik tombol:",
-                buttons=[
-                    [Button.inline("Lihat Detail & Merge", b"show_summary")],
-                    [Button.inline("Batal & Hapus", b"cancel")],
-                ],
-                parse_mode='md'
-            )
+            # Mulai loop update otomatis setelah download selesai
+            await self.start_status_refresh_loop(session)
+            
         except asyncio.CancelledError:
             logger.info(f"Download cancelled untuk user {uid}")
             # Jangan update status — session sudah/akan dibersihkan oleh cmd_cancel
@@ -923,9 +1073,19 @@ class TelegramBot:
             [Button.inline(f"Merge -> {fmt_icon}!", b"merge")],
             [Button.inline("Batal & Hapus", b"cancel")],
         ]
-        await self.update_status(session, text, buttons=buttons, parse_mode='md')
+        await self.update_status(session, text, buttons=buttons, parse_mode='md', force_repost=True)
 
-    # ── Callback handler ──────────────────────────────────────────────────────
+    async def debug_handler(self, event):
+        # Ini akan menangkap semua pesan yang tidak ditangani handler lain
+        if event.message and event.message.text:
+            msg = event.message.text.lower()
+            if msg.startswith('/'): return # Abaikan command lain
+            
+        # Log untuk debugging
+        uid = event.sender_id
+        logger.info(f"DEBUG: Received message from {uid}")
+        if event.message.file:
+            logger.info(f"DEBUG: File detected: {event.message.file.name} (Mime: {event.message.file.mime_type})")
 
     async def callback_handler(self, event):
         uid  = event.sender_id
@@ -937,16 +1097,174 @@ class TelegramBot:
 
         session = self.sessions[uid]
 
-        if data == "fmt_mp4":
-            session.output_format = "mp4"
-            await event.answer("Format diset ke MP4")
-            await self.show_summary(event, uid)
+        if data == "config_main":
+            await self.show_config_main(uid)
+            await event.answer()
             return
 
-        if data == "fmt_mkv":
-            session.output_format = "mkv"
-            await event.answer("Format diset ke MKV")
-            await self.show_summary(event, uid)
+        if data == "close_menu":
+            await self.update_status(session, "✅ Konfigurasi disimpan. Silakan kirim file video Anda.")
+            await event.answer()
+            return
+
+        if data == "cmd_start":
+            await self.cmd_start(event)
+            await event.answer()
+            return
+
+        # --- Sub-menus ---
+        if data == "conf_v_enc":
+            buttons = [
+                [Button.inline("Default", b"set_v_enc_Default")],
+                [Button.inline("H.264", b"set_v_enc_libx264"), Button.inline("H.265", b"set_v_enc_libx265")],
+                [Button.inline("VP8", b"set_v_enc_libvpx"), Button.inline("VP9", b"set_v_enc_libvpx-vp9")],
+                [Button.inline("AV1", b"set_v_enc_libaom-av1"), Button.inline("Theora", b"set_v_enc_libtheora")],
+                [Button.inline("MPEG4", b"set_v_enc_mpeg4"), Button.inline("MPEG2", b"set_v_enc_mpeg2video")],
+                [Button.inline("↩️ Kembali", b"config_main")]
+            ]
+            await self.update_status(session, "📌 **Silahkan pilih video encoder anda !**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_v_enc_"):
+            session.video_encoder = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Video Encoder: {session.video_encoder}")
+            return
+
+        if data == "conf_v_bit":
+            rates = ["Default", "500k", "1200k", "2000k", "3000k", "4000k", "5000k", "6000k", "7000k", "8000k", "9000k", "10000k"]
+            buttons = []
+            for i in range(0, len(rates), 2):
+                row = [Button.inline(rates[i], f"set_v_bit_{rates[i]}".encode())]
+                if i+1 < len(rates):
+                    row.append(Button.inline(rates[i+1], f"set_v_bit_{rates[i+1]}".encode()))
+                buttons.append(row)
+            buttons.append([Button.inline("↩️ Kembali", b"config_main")])
+            await self.update_status(session, "📌 **Silahkan pilih video bitrate anda !**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_v_bit_"):
+            session.video_bitrate = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Video Bitrate: {session.video_bitrate}")
+            return
+
+        if data == "conf_a_enc":
+            buttons = [
+                [Button.inline("Default", b"set_a_enc_Default")],
+                [Button.inline("AAC", b"set_a_enc_aac"), Button.inline("MP3", b"set_a_enc_libmp3lame")],
+                [Button.inline("Opus", b"set_a_enc_libopus"), Button.inline("Vorbis", b"set_a_enc_libvorbis")],
+                [Button.inline("WAV", b"set_a_enc_pcm_s16le"), Button.inline("MPEG", b"set_a_enc_mp2")],
+                [Button.inline("FLAC", b"set_a_enc_flac"), Button.inline("ALAC", b"set_a_enc_alac")],
+                [Button.inline("↩️ Kembali", b"config_main")]
+            ]
+            await self.update_status(session, "📌 **Silahkan pilih audio encoder anda !**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_a_enc_"):
+            session.audio_encoder = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Audio Encoder: {session.audio_encoder}")
+            return
+
+        if data == "conf_a_bit":
+            rates = ["Default", "32 kbps", "64 kbps", "96 kbps", "128 kbps", "192 kbps", "256 kbps", "320 kbps", "512 kbps"]
+            buttons = []
+            for i in range(0, len(rates), 2):
+                row = [Button.inline(rates[i], f"set_a_bit_{rates[i].replace(' ', '_')}".encode())]
+                if i+1 < len(rates):
+                    row.append(Button.inline(rates[i+1], f"set_a_bit_{rates[i+1].replace(' ', '_')}".encode()))
+                buttons.append(row)
+            buttons.append([Button.inline("↩️ Kembali", b"config_main")])
+            await self.update_status(session, "📌 **Silahkan pilih audio bitrate anda !**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_a_bit_"):
+            session.audio_bitrate = data.split("_")[-1].replace("_", " ")
+            await self.show_config_main(uid)
+            await event.answer(f"Audio Bitrate: {session.audio_bitrate}")
+            return
+
+        if data == "conf_preset":
+            presets = ["Default", "Ultrafast", "Superfast", "Veryfast", "Faster", "Fast", "Medium", "Slow", "Slower", "Veryslow"]
+            buttons = []
+            for i in range(0, len(presets), 2):
+                row = [Button.inline(presets[i], f"set_preset_{presets[i]}".encode())]
+                if i+1 < len(presets):
+                    row.append(Button.inline(presets[i+1], f"set_preset_{presets[i+1]}".encode()))
+                buttons.append(row)
+            buttons.append([Button.inline("↩️ Kembali", b"config_main")])
+            text = (
+                "📌 **Silahkan pilih preset anda !**\n\n"
+                "⚠️ **Note:** Semakin cepat proses kompresi, semakin besar ukuran file video"
+            )
+            await self.update_status(session, text, buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_preset_"):
+            session.preset = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Preset: {session.preset}")
+            return
+
+        if data == "conf_crf":
+            crfs = ["Default", "18", "20", "23", "25", "28", "30"]
+            buttons = []
+            for i in range(0, len(crfs), 2):
+                row = [Button.inline(crfs[i], f"set_crf_{crfs[i]}".encode())]
+                if i+1 < len(crfs):
+                    row.append(Button.inline(crfs[i+1], f"set_crf_{crfs[i+1]}".encode()))
+                buttons.append(row)
+            buttons.append([Button.inline("↩️ Kembali", b"config_main")])
+            await self.update_status(session, "📌 **Silahkan pilih CRF anda !**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_crf_"):
+            session.crf = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"CRF: {session.crf}")
+            return
+
+        if data == "conf_sub_type":
+            buttons = [
+                [Button.inline("Softsub (Text)", b"set_sub_type_Softsub")],
+                [Button.inline("Hardsub (Burn-in)", b"set_sub_type_Hardsub")],
+                [Button.inline("↩️ Kembali", b"config_main")]
+            ]
+            text = (
+                "📌 **Pilih Tipe Subtitle**\n\n"
+                "• **Softsub:** Subtitle bisa diubah-ubah/dimatikan (tidak re-encode video).\n"
+                "• **Hardsub:** Subtitle menyatu dengan gambar (re-encode penuh, permanen)."
+            )
+            await self.update_status(session, text, buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_sub_type_"):
+            session.subtitle_type = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Subtitle: {session.subtitle_type}")
+            return
+
+        if data == "conf_out_fmt":
+            buttons = [
+                [Button.inline("MP4", b"set_out_fmt_mp4"), Button.inline("MKV", b"set_out_fmt_mkv")],
+                [Button.inline("↩️ Kembali", b"config_main")]
+            ]
+            await self.update_status(session, "📌 **Pilih Format Output**", buttons=buttons, parse_mode='md')
+            await event.answer()
+            return
+
+        if data.startswith("set_out_fmt_"):
+            session.output_format = data.split("_")[-1]
+            await self.show_config_main(uid)
+            await event.answer(f"Format: {session.output_format.upper()}")
             return
 
         if data == "cancel":
@@ -983,6 +1301,9 @@ class TelegramBot:
                 await self.update_status(session, "Minimal 2 video untuk merge.")
                 await event.answer()
                 return
+                
+            session.stop_status_loop()
+            session.is_processing = True
 
             if get_available_ram_gb() < MIN_RAM_AVAILABLE_GB:
                 await self.update_status(session, f"RAM tersisa {get_available_ram_gb():.1f}GB. Tunggu lalu coba lagi.")
@@ -1001,7 +1322,8 @@ class TelegramBot:
                 f"**Menyiapkan merge [{out_ext}]...**\n\n"
                 f"{len(session.videos)} video  {format_size(session.get_total_size())}\n"
                 f"Masuk antrian...",
-                parse_mode='md'
+                parse_mode='md',
+                force_repost=True
             )
 
             async def merge_progress(pct: float, pdata: dict):
@@ -1126,6 +1448,9 @@ class TelegramBot:
     async def auto_cleanup_loop(self):
         while True:
             try:
+                # Heartbeat log
+                logger.info("Bot Heartbeat: Active sessions = %d", len(self.sessions))
+                
                 now     = datetime.now()
                 expired = [uid for uid, s in self.sessions.items()
                            if (now - s.created_at).total_seconds() > 7200]

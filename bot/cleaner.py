@@ -1,34 +1,27 @@
+import asyncio
+import os
+import time
 import shutil
-import logging
-from pathlib import Path
+from bot.config import Config
 
-logger = logging.getLogger(__name__)
-
-def cleanup_temp_files(uid, base_temp_dir: Path):
-    """Clean up temporary directory for a specific user."""
-    user_dir = base_temp_dir / f"user_{uid}"
-    if user_dir.exists():
+async def auto_cleaner():
+    """Background task to clean up old temp files every 5 minutes."""
+    while True:
         try:
-            shutil.rmtree(user_dir)
-            logger.info(f"Successfully cleaned up temp files for user {uid}")
-            return True
+            now = time.time()
+            if os.path.exists(Config.TEMP_DIR):
+                for user_folder in os.listdir(Config.TEMP_DIR):
+                    folder_path = os.path.join(Config.TEMP_DIR, user_folder)
+                    if os.path.isdir(folder_path):
+                        # If folder hasn't been modified for 1 hour, delete it
+                        if now - os.path.getmtime(folder_path) > 3600:
+                            shutil.rmtree(folder_path)
         except Exception as e:
-            logger.error(f"Failed to cleanup temp files for {uid}: {e}")
-            return False
-    return True
+            print(f"Cleaner error: {e}")
+        
+        await asyncio.sleep(300) # 5 minutes
 
-def cleanup_all_temp_files(base_temp_dir: Path):
-    """Clean up all temporary files on bot startup."""
-    if base_temp_dir.exists():
-        try:
-            for item in base_temp_dir.iterdir():
-                if item.is_dir() and item.name.startswith("user_"):
-                    shutil.rmtree(item)
-                elif item.is_file() and item.name != ".gitignore":
-                    item.unlink()
-            logger.info("Successfully cleaned up all temp files on startup.")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cleanup all temp files: {e}")
-            return False
-    return True
+def delete_user_data(user_id):
+    path = os.path.join(Config.TEMP_DIR, str(user_id))
+    if os.path.exists(path):
+        shutil.rmtree(path)

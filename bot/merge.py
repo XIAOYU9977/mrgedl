@@ -1,239 +1,203 @@
 import asyncio
-import asyncio.subprocess
-import re
-import json
-import logging
-import subprocess
 import os
-from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Optional, Tuple
-from bot.progress import calculate_progress, progress_bar
-from bot.utils import format_duration, format_size
+import re
+import logging
+import shutil
+from asyncio import subprocess
+from bot.config import Config
+from bot.utils import get_safe_percentage, sort_episodes
 
 logger = logging.getLogger(__name__)
 
-async def get_video_bitrate(file_path: Path) -> int:
-    """Get the average bitrate of a video file using ffprobe (in bps)."""
+# Global tracker for active merge processes
+active_processes = {}
+
+async def get_best_encoder():
+    """
+    Detects the best available H.264 encoder.
+    """
+    cmd = [Config.FFMPEG_PATH, "-encoders"]
     try:
-        cmd = [
-            'ffprobe', '-v', 'error', '-show_entries', 'format=bit_rate',
-            '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
-            val = stdout.decode().strip()
-            return int(val) if val.isdigit() else 0
-        return 0
-    except Exception as e:
-        logger.error(f"Error getting bitrate for {file_path}: {e}")
-        return 0
-
-async def get_video_duration(file_path: Path) -> float:
-    """Get the duration of a video file using ffprobe."""
-    try:
-        cmd = [
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', str(file_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode == 0:
-            return float(stdout.decode().strip())
-        return 0.0
-    except Exception as e:
-        logger.error(f"Error getting duration for {file_path}: {e}")
-        return 0.0
-
-def collect_episode_files(directory: Path) -> List[Path]:
-    """Collect all video files in a directory."""
-    extensions = ['.mp4', '.mkv', '.avi', '.mov']
-    return [p for p in directory.iterdir() if p.suffix.lower() in extensions]
-
-def extract_episode_number(text: str) -> int:
-    """Extract episode number from text (filename or caption)."""
-    patterns = [
-        r'[Ee]p(?:isode)?[\s._-]*(\d+)',
-        r'[Ee](\d+)',  # Support E01
-        r'[Pp]art[\s._-]*(\d+)',
-        r'(\d{1,4})'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-             return int(match.group(1))
-    return 0
-
-def sort_episode_order(file_data: List[Dict]) -> List[Path]:
-    """
-    Sort files based on episode numbers extracted from filenames and captions.
-    file_data: List of dicts, each containing 'path' (Path) and 'search_text' (str)
-    """
-    def get_sort_key(item):
-        ep_num = extract_episode_number(item['search_text'])
-        # Fallback to Path.name if no number found, though shouldn't happen often
-        return (ep_num, item['path'].name)
-
-    sorted_items = sorted(file_data, key=get_sort_key)
-    return [item['path'] for item in sorted_items]
-
-async def generate_concat_list(files: List[Path], output_list: Path):
-    """Generate a text file for ffmpeg concat demuxer."""
-    content = ""
-    for f in files:
-        # Proper path escaping for ffmpeg concat file
-        escaped_path = str(f.absolute()).replace("'", "'\\''")
-        content += f"file '{escaped_path}'\n"
-    
-    with open(output_list, 'w', encoding='utf-8') as f:
-        f.write(content)
-
-def escape_ffmpeg_path(path_str: str) -> str:
-    """Escape Windows paths for FFmpeg filter strings."""
-    # Replace backslashes with forward slashes
-    path_str = path_str.replace('\\', '/')
-    # Escape colon (e.g., C:/ -> C\:/)
-    path_str = path_str.replace(':', '\\:')
-    return path_str
-
-async def merge_video_files(list_file: Path, output_file: Path, total_duration: float, 
-                        output_format: str = "mkv", sub_mode: str = "softsub", progress_callback=None):
-    """
-    Merge video files with custom interactive options and styling for Hardsub.
-    """
-    
-    stderr_lines = []
-    
-    # Custom Subtitle Style for Hardsub
-    # Font (Standard Symbols PS), White, Size 10, Bold, Outline 1 (Black), Offset (MarginV) 90
-    hardsub_style = (
-        "FontName=Standard Symbols PS,"
-        "FontSize=10,"
-        "Bold=1,"
-        "PrimaryColour=&H00FFFFFF,"
-        "Outline=1,"
-        "OutlineColour=&H00000000,"
-        "MarginV=90"
-    )
-
-    if sub_mode == "hardsub":
-        # Step 1: Merge to a temporary file first (Fast Copy)
-        intermediate_file = output_file.parent / f"temp_{output_file.name}.mkv"
-        logger.info(f"Hardsub Phase 1: Merging into intermediate {intermediate_file}")
+        stdout, _ = await process.communicate()
+        encoders_str = stdout.decode().lower()
         
-        cmd_merge = [
-            'ffmpeg', '-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0', '-i', str(list_file),
-            '-c:v', 'copy', '-c:a', 'copy', '-c:s', 'srt', # Convert mov_text to srt for MKV intermediate
-            '-avoid_negative_ts', 'make_zero', str(intermediate_file)
-        ]
-        
-        p1 = await asyncio.create_subprocess_exec(*cmd_merge, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, e1 = await p1.communicate()
-        
-        if p1.returncode != 0 or not intermediate_file.exists():
-            logger.error(f"Hardsub Phase 1 failed: {e1.decode() if e1 else 'Unknown'}")
-            return False
-            
-        # Step 2: Burn subtitles with bitrate matching to keep size similar
-        logger.info("Hardsub Phase 2: Burning subtitles with size optimization")
-        escaped_sub_path = escape_ffmpeg_path(str(intermediate_file.absolute()))
-        
-        # Get original bitrate to match size
-        orig_bitrate = await get_video_bitrate(intermediate_file)
-        
-        cmd = [
-            'ffmpeg', '-y', '-i', str(intermediate_file),
-            '-vf', f"subtitles='{escaped_sub_path}':force_style='{hardsub_style}'", 
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '0'
-        ]
-        
-        if orig_bitrate > 0:
-            # Match original bitrate to keep file size almost identical
-            cmd.extend(['-b:v', str(orig_bitrate), '-maxrate', str(int(orig_bitrate * 1.5)), '-bufsize', str(orig_bitrate * 2)])
+        if "h264_nvenc" in encoders_str:
+            return "h264_nvenc"
+        elif "h264_qsv" in encoders_str:
+            return "h264_qsv"
+        elif "h264_amf" in encoders_str:
+            return "h264_amf"
         else:
-            # Fallback to a efficient CRF if bitrate detection fails
-            cmd.extend(['-crf', '24'])
-            
-        cmd.extend([
-            '-c:a', 'aac', '-b:a', '128k',
-            '-progress', 'pipe:1', str(output_file)
-        ])
+            return "libx264"
+    except Exception as e:
+        logger.warning(f"Error detecting encoders: {e}. Falling back to libx264")
+        return "libx264"
+
+async def merge_video_files(file_list, user_id, mode, message, settings=None):
+    """
+    Main function to merge video files using FFmpeg.
+    """
+    if not file_list:
+        raise Exception("Daftar file kosong.")
+
+    if settings is None:
+        settings = {}
+
+    temp_dir = os.path.join(Config.TEMP_DIR, str(user_id))
+    output_filename = f"merged_{user_id}.mkv"
+    output_path = os.path.join(temp_dir, output_filename)
+    
+    # Generate concat list
+    list_file_path = os.path.join(temp_dir, "concat_list.txt")
+    with open(list_file_path, "w", encoding="utf-8") as f:
+        for file in file_list:
+            abs_path = os.path.abspath(file).replace("\\", "/")
+            f.write(f"file '{abs_path}'\n")
+
+    # Command construction
+    cmd = [Config.FFMPEG_PATH, "-f", "concat", "-safe", "0", "-i", list_file_path]
+    
+    if mode == 1:
+        logger.info(f"User {user_id}: Starting Softsub Merge (Stream Copy)")
+        cmd += ["-c", "copy", "-y", output_path]
     else:
-        # Softsub (Stream Copy) or No Subtitles
-        cmd = [
-            'ffmpeg', '-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0', '-i', str(list_file),
-            '-c:v', 'copy', '-c:a', 'copy',
-            '-avoid_negative_ts', 'make_zero'
-        ]
+        logger.info(f"User {user_id}: Starting Hardsub Merge (Encoding Custom)")
         
-        if sub_mode == "none":
-            cmd.append("-sn")
-        else:
-            # Safe subtitle conversion for containers
-            if output_format.lower() == "mkv":
-                cmd.extend(['-c:s', 'srt'])
-            else:
-                cmd.extend(['-c:s', 'mov_text'])
+        # Video Encoder
+        v_enc = settings.get("video_encoder", "Default")
+        if v_enc == "Default":
+            v_enc = await get_best_encoder()
+        cmd += ["-c:v", v_enc]
+        
+        # Video Bitrate
+        v_bit = settings.get("video_bitrate", "Default")
+        if v_bit != "Default":
+            cmd += ["-b:v", v_bit]
             
-        cmd.extend([
-            '-progress', 'pipe:1', str(output_file)
-        ])
+        # CRF
+        crf = settings.get("crf", "Default")
+        if crf != "Default":
+            cmd += ["-crf", crf]
+            
+        # Preset
+        preset = settings.get("preset", "Default")
+        if preset != "Default":
+            cmd += ["-preset", preset.lower()]
+            
+        # Audio Encoder
+        a_enc = settings.get("audio_encoder", "Default")
+        if a_enc != "Default":
+            cmd += ["-c:a", a_enc]
+        else:
+            cmd += ["-c:a", "copy"] # Default to copy if not specified
+            
+        # Audio Bitrate
+        a_bit = settings.get("audio_bitrate", "Default")
+        if a_bit != "Default" and a_enc != "Default":
+            # Convert "128 kbps" to "128k"
+            a_bit_clean = a_bit.lower().replace(" kbps", "k").replace(" ", "")
+            cmd += ["-b:a", a_bit_clean]
+            
+        cmd += ["-y", output_path]
 
-    logger.info(f"Running FFmpeg: {' '.join(cmd)}")
-    
     process = await asyncio.create_subprocess_exec(
         *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
     )
+    
+    # Store for cancellation
+    active_processes[user_id] = process
 
-    if not process or not process.stdout:
-        return False
-
-    async def read_stderr(stream):
+    # Parsing patterns
+    duration_pattern = re.compile(r"Duration: (\d+):(\d+):(\d+).(\d+)")
+    time_pattern = re.compile(r"time=(\d+):(\d+):(\d+).(\d+)")
+    
+    total_seconds = 0
+    
+    try:
         while True:
-            line = await stream.readline()
-            if not line: break
-            stderr_lines.append(line.decode().strip())
+            if not process.stdout:
+                break
+            line = await process.stdout.readline()
+            if not line:
+                break
+            
+            line_str = line.decode().strip()
+            
+            # Parse total duration
+            if total_seconds == 0:
+                dur_match = duration_pattern.search(line_str)
+                if dur_match:
+                    total_seconds = int(dur_match.group(1)) * 3600 + int(dur_match.group(2)) * 60 + int(dur_match.group(3))
+                    logger.debug(f"Merge Duration: {total_seconds}s")
+            
+            # Parse current progress time
+            time_match = time_pattern.search(line_str)
+            if time_match:
+                current_seconds = int(time_match.group(1)) * 3600 + int(time_match.group(2)) * 60 + int(time_match.group(3))
+                
+                percentage = get_safe_percentage(current_seconds, total_seconds)
+                
+                # Fallback if duration is unknown
+                if total_seconds <= 0:
+                    progress_text = f"Merging... (processed {current_seconds}s)"
+                else:
+                    bar = "█" * int(percentage / 10) + "░" * (10 - int(percentage / 10))
+                    progress_text = f"**Merging Videos...**\n`[{bar}]` {percentage:.2f}%"
+                
+                try:
+                    await message.edit(progress_text)
+                except:
+                    pass
+    finally:
+        if user_id in active_processes:
+            del active_processes[user_id]
+            
+    await process.wait()
+    
+    if process.returncode == 0 and os.path.exists(output_path):
+        logger.info(f"User {user_id}: Merge completed successfully.")
+        return output_path
+    else:
+        if process.returncode == -9 or process.returncode == 15 or process.returncode == 1: 
+             # Check if it was manually terminated
+             logger.info(f"User {user_id}: Merge process finished with code {process.returncode}")
+             if not os.path.exists(output_path):
+                 return None
+        logger.error(f"User {user_id}: FFmpeg failed with code {process.returncode}")
+        raise Exception("FFmpeg merge gagal. Silakan periksa format file.")
 
-    stderr_task = asyncio.create_task(read_stderr(process.stderr))
-
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        
-        line_str = line.decode().strip()
-        
-        if progress_callback and line_str.startswith("out_time_ms="):
+def cancel_merge(user_id):
+    """
+    Kills the active merge process for a user.
+    """
+    if user_id in active_processes:
+        process = active_processes[user_id]
+        try:
+            process.terminate()
+            logger.info(f"Terminated merge process for user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error terminating process for user {user_id}: {e}")
             try:
-                time_ms = int(line_str.split("=")[1]) / 1000000
-                pct = (time_ms / total_duration * 100) if total_duration > 0 else 0
-                await progress_callback(pct, time_ms)
+                process.kill()
+                return True
             except:
                 pass
-        
-        if line_str == "progress=end":
-            break
+    return False
 
-    await process.wait()
-    await stderr_task
-    
-    if process.returncode != 0:
-        logger.error(f"FFmpeg failed: {' | '.join(stderr_lines[-5:])}")
-
-    # Cleanup intermediate file
-    if sub_mode == "hardsub" and 'intermediate_file' in locals() and intermediate_file.exists():
-        try: os.remove(intermediate_file)
-        except: pass
-            
-    return process.returncode == 0
+def cleanup_temp_files(user_id):
+    """Removes user's temporary directory."""
+    path = os.path.join(Config.TEMP_DIR, str(user_id))
+    if os.path.exists(path):
+        try:
+            shutil.rmtree(path)
+            logger.info(f"Cleaned up temp files for user {user_id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup user {user_id}: {e}")

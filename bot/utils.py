@@ -1,116 +1,60 @@
-import logging
-import sys
-import psutil
+import re
+import os
 import shutil
-from pathlib import Path
+import logging
+from bot.config import Config
 
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("bot.log", encoding='utf-8')
-        ]
-    )
-    return logging.getLogger("MergeBot")
+# Setup Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def format_size(size_bytes):
-    if size_bytes == 0: return "0B"
-    units = ("B", "KB", "MB", "GB", "TB")
-    import math
-    i = int(math.floor(math.log(size_bytes, 1024)))
-    p = math.pow(1024, i)
-    s = round(size_bytes / p, 2)
-    return f"{s} {units[i]}"
+def get_safe_percentage(current, total):
+    """Calculates percentage safely to avoid ZeroDivisionError."""
+    if total <= 0:
+        return 0.0
+    return min(100.0, (current / total) * 100.0)
 
-def format_duration(seconds):
-    seconds = int(seconds)
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
+def get_episode_number(filename):
+    """
+    Extract episode number from filename.
+    Matches: E01, Episode 1, 01, etc.
+    """
+    # Patterns to look for
+    patterns = [
+        r'E(\d+)',            # E01
+        r'Episode\s*(\d+)',   # Episode 01
+        r'(\d+)'              # 01
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return 999  # Default high number if not found
 
-def get_available_ram_gb():
-    return psutil.virtual_memory().available / (1024**3)
+def sort_episodes(file_list):
+    """Sorts a list of files based on extracted episode number."""
+    return sorted(file_list, key=lambda x: get_episode_number(x))
 
-def get_disk_free_gb(path):
-    return shutil.disk_usage(path).free / (1024**3)
+def get_user_temp_dir(user_id):
+    path = os.path.join(Config.TEMP_DIR, str(user_id))
+    os.makedirs(path, exist_ok=True)
+    return path
 
-async def get_mediainfo(file_path: Path) -> str:
-    """Get technical info of a video file."""
-    import asyncio
-    import json
-    if not file_path.exists():
-        return "❌ File tidak ditemukan untuk MediaInfo."
-        
-    try:
-        cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-show_streams', str(file_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, _ = await proc.communicate()
-        if not stdout:
-            return "❌ Gagal mendapatkan data ffprobe."
-            
-        data = json.loads(stdout.decode())
-        
-        format_info = data.get('format', {})
-        streams = data.get('streams', [])
-        
-        if not streams:
-            return "❌ Tidak ada stream data ditemukan di file ini."
-            
-        v_stream = next((s for s in streams if s.get('codec_type') == 'video'), {})
-        a_stream = next((s for s in streams if s.get('codec_type') == 'audio'), {})
-        subs = [s for s in streams if s.get('codec_type') == 'subtitle']
-        
-        # Details
-        width = v_stream.get('width', 'N/A')
-        height = v_stream.get('height', 'N/A')
-        res = f"{width}x{height}" if width != 'N/A' else 'N/A'
-        v_codec = v_stream.get('codec_name', 'N/A').upper()
-        a_codec = a_stream.get('codec_name', 'N/A').upper()
-        
-        # Bitrates
-        v_bitrate = int(v_stream.get('bit_rate', 0)) or int(format_info.get('bit_rate', 0))
-        a_bitrate = int(a_stream.get('bit_rate', 0))
-        v_bitrate_str = f"{v_bitrate // 1000} kbps" if v_bitrate else "N/A"
-        a_bitrate_str = f"{a_bitrate // 1000} kbps" if a_bitrate else "N/A"
-        
-        # Frame rate
-        fps_val = "N/A"
-        r_frame_rate = v_stream.get('r_frame_rate', '0/0')
-        if r_frame_rate and '/' in r_frame_rate:
-            try:
-                fps_base = r_frame_rate.split('/')
-                if len(fps_base) == 2 and int(fps_base[1]) != 0:
-                    fps_val = round(int(fps_base[0]) / int(fps_base[1]), 2)
-            except: pass
-        
-        size = format_size(int(format_info.get('size', 0)))
-        dur = format_duration(float(format_info.get('duration', 0)))
-        
-        info = (
-            f"📊 **Media Info Details**\n\n"
-            f"📁 **File:** `{file_path.name}`\n"
-            f"⚖️ **Size:** {size}\n"
-            f"⏳ **Duration:** {dur}\n"
-            f"📏 **Resolution:** {res}\n"
-            f"🎥 **Video Codec:** {v_codec}\n"
-            f"🎞 **Frame Rate:** {fps_val} FPS\n"
-            f"📈 **Video Bitrate:** {v_bitrate_str}\n"
-            f"🔊 **Audio Codec:** {a_codec}\n"
-            f"🎵 **Audio Bitrate:** {a_bitrate_str}\n"
-            f"💬 **Subtitle Tracks:** {len(subs)}\n"
-        )
-        return info
-    except Exception as e:
-        return f"❌ Error getting MediaInfo: {str(e)}"
+def clean_user_dir(user_id):
+    path = os.path.join(Config.TEMP_DIR, str(user_id))
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+def format_bytes(size):
+    # 2**10 = 1024
+    power = 2**10
+    n = 0
+    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {power_labels[n]}B"

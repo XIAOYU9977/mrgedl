@@ -1,392 +1,470 @@
 import os
 import asyncio
 import logging
-import time
-from pathlib import Path
-from pyrogram import Client, filters, enums
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import RPCError, FloodWait
+import shutil
+from pyrogram import Client, filters, idle
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
-from bot.utils import setup_logging, format_size, get_available_ram_gb, get_disk_free_gb, format_duration, get_mediainfo
-from bot.progress import get_progress_text, progress_bar
-from bot.downloader import Downloader
-from bot.merge import (
-    get_video_duration, collect_episode_files, sort_episode_order,
-    generate_concat_list, merge_video_files
-)
-from bot.cleaner import cleanup_temp_files, cleanup_all_temp_files
+from bot.config import Config
+from bot.utils import get_user_temp_dir, clean_user_dir, sort_episodes
+from bot.downloader import download_tg
+from bot.merge import merge_video_files, cleanup_temp_files, cancel_merge
+from bot.cleaner import auto_cleaner
 
-# --- CONFIGURATION ---
-API_ID = 30653860
-API_HASH = "98e0a87077d4fc642ce183dfd7f46a19"
-BOT_TOKEN = "8670555448:AAHz85JOrOjwyY_V10NvbHB_Fipx5qGuy9Y"
+# Logging Setup
+logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).parent.parent
-TEMP_DIR = BASE_DIR / "temp"
-TEMP_DIR.mkdir(exist_ok=True)
-
-# System constraints - Scalable to 200 episodes
-MIN_RAM_GB = 1.0
-MIN_DISK_GB = 5.0
-MAX_FILES = 200
-
-# --- BOT INITIALIZATION ---
-logger = setup_logging()
-cleanup_all_temp_files(TEMP_DIR)
-app = Client("merge_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-downloader = Downloader(app)
-
-# User sessions
+# User Session Management
+# States: IDLE, DROPPING_FILES, MERGING, UPLOADING
 user_sessions = {}
-
-# --- HELPERS ---
 
 def get_session(user_id):
     if user_id not in user_sessions:
         user_sessions[user_id] = {
             "files": [],
-            "status": "waiting_files",
-            "msg": None,
-            "cancel": False,
-            "last_update": 0.0,
-            "format": "mkv",
-            "sub_mode": "softsub",
-            "recv_msg": None,
-            "output_name": "merged_video"
+            "mode": 1,
+            "status": "IDLE",
+            "current_task": None,
+            "video_encoder": "Default",
+            "video_bitrate": "Default",
+            "audio_encoder": "Default",
+            "audio_bitrate": "Default",
+            "preset": "Default",
+            "crf": "Default"
         }
     return user_sessions[user_id]
 
-async def update_status_msg(user_id, text, reply_markup=None, force=False):
+bot = Client(
+    "fresh_video_merge_bot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN
+)
+
+@bot.on_message(filters.command("start"))
+async def start_handler(client, message):
+    logger.info(f"Received /start from {message.from_user.id}")
+    user_id = message.from_user.id
     session = get_session(user_id)
-    now = time.time()
+    session["status"] = "IDLE"
     
-    last_upd = session.get("last_update", 0.0)
-    if not force and now - last_upd < 3:
-        return
-    
-    session["last_update"] = float(now)
-    pm = enums.ParseMode.MARKDOWN
-    
-    try:
-        if session.get("msg"):
-            await session["msg"].edit_text(text, reply_markup=reply_markup, parse_mode=pm)
-        else:
-            session["msg"] = await app.send_message(user_id, text, reply_markup=reply_markup, parse_mode=pm)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        try:
-            await session["msg"].edit_text(text, reply_markup=reply_markup, parse_mode=pm)
-        except: pass
-    except Exception as e:
-        logger.error(f"Failed to update status message for {user_id}: {e}")
-
-# --- HANDLERS ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client, message: Message):
-    uid = message.from_user.id
-    user_sessions.pop(uid, None)
-    cleanup_temp_files(uid, TEMP_DIR)
-    
-    await message.reply(
-        "🎬 **Telegram Merge Episode Bot**\n\n"
-        "Kirimkan video-video episode yang ingin Anda gabungkan.\n"
-        "Setelah semua video terkirim, gunakan perintah /merge.\n\n"
-        "**Perintah:**\n"
-        "/merge - Mulai proses penggabungan\n"
-        "/status - Cek status pengiriman file\n"
-        "/cancel - Batalkan dan hapus semua file sementara",
-        parse_mode=enums.ParseMode.MARKDOWN
+    welcome_text = (
+        "👋 **Selamat datang di BOT MERGE EPISODE!**\n\n"
+        "Kirim video (MKV/MP4) yang ingin digabung.\n"
+        "Bot akan otomatis mengurutkan berdasarkan nama file.\n\n"
+        "**Pilih Mode Subtitle:**\n"
+        "Mode 1: Softsub (Cepat, Tanpa Encode)\n"
+        "Mode 2: Hardsub (Lambat, Encode)\n\n"
+        "Status: **Idle**"
     )
-
-@app.on_message((filters.video | filters.document) & filters.private)
-async def video_handler(client, message: Message):
-    is_video = False
-    if message.video:
-        is_video = True
-    elif message.document:
-        mime = (message.document.mime_type or "").lower()
-        name = (message.document.file_name or "").lower()
-        if mime.startswith("video/") or "matroska" in mime or name.endswith((".mkv", ".mp4", ".mov", ".avi")):
-            is_video = True
-            
-    if not is_video:
-        return
-
-    uid = message.from_user.id
-    session = get_session(uid)
     
-    if session["status"] != "waiting_files":
-        await message.reply("Proses lain sedang berjalan. Harap tunggu atau gunakan /cancel.")
-        return
-
-    if len(session["files"]) >= MAX_FILES:
-        await message.reply(f"Maksimal {MAX_FILES} file per penggabungan.")
-        return
-
-    session["files"].append(message)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Mode 1 (Soft)", callback_data="set_mode_1"),
+            InlineKeyboardButton("Mode 2 (Hard)", callback_data="set_mode_2")
+        ]
+    ])
     
-    count = len(session["files"])
-    text = f"✅ Video diterima ({count} file). Kirim lagi atau tekan /merge."
-    
-    try:
-        if session.get("recv_msg"):
-            await session["recv_msg"].edit_text(text)
-        else:
-            session["recv_msg"] = await message.reply(text)
-    except:
-        # Fallback if message was deleted or can't be edited
-        session["recv_msg"] = await message.reply(text)
+    await message.reply_text(welcome_text, reply_markup=keyboard)
 
-@app.on_message(filters.command("status") & filters.private)
-async def status_cmd(client, message: Message):
-    uid = message.from_user.id
-    session = get_session(uid)
+@bot.on_callback_query(filters.regex(r"^set_mode_(\d)$"))
+async def mode_callback(client, callback_query):
+    mode = int(callback_query.data.split("_")[-1])
+    user_id = callback_query.from_user.id
+    session = get_session(user_id)
+    session["mode"] = mode
     
-    count = len(session["files"])
-    status = session["status"]
+    await callback_query.answer(f"Mode diatur ke {mode}")
     
     text = (
-        f"📊 **Status Bot**\n\n"
-        f"Jumlah file: {count}\n"
-        f"Status: {status}\n"
+        f"✅ Mode subtitle diatur ke: **Mode {mode}**\n\n"
+        "📌 **Silahkan pilih menu encoding anda !**\n\n"
+        f"• Video Encoder: `{session['video_encoder']}`\n"
+        f"• Video Bitrate: `{session['video_bitrate']}`\n"
+        f"• Audio Encoder: `{session['audio_encoder']}`\n"
+        f"• Audio Bitrate: `{session['audio_bitrate']}`\n"
+        f"• CRF: `{session['crf']}`\n"
+        f"• Preset: `{session['preset']}`\n\n"
+        "Silahkan kirim file video Anda atau buka /settings untuk mengubah konfigurasi."
     )
-    await message.reply(text, parse_mode=enums.ParseMode.MARKDOWN)
-
-@app.on_message(filters.command("cancel") & filters.private)
-async def cancel_cmd(client, message: Message):
-    uid = message.from_user.id
-    session = get_session(uid)
     
-    if session["status"] == "processing":
-        session["cancel"] = True
-        await message.reply("⛔ **Proses dibatalkan secara paksa oleh user.**\nFile sementara sedang dibersihkan...")
-    else:
-        cleanup_temp_files(uid, TEMP_DIR)
-        user_sessions.pop(uid, None)
-        await message.reply("❌ Proses dibatalkan dan file sementara telah dihapus.")
-
-@app.on_callback_query(filters.regex(r"^mi_show"))
-async def mediainfo_cb(client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    session = get_session(uid)
-    info = session.get("last_mediainfo")
-    
-    if not info:
-        await cb.answer("❌ Informasi sudah kedaluwarsa atau file telah dihapus.", show_alert=True)
-        return
-
-    await cb.answer()
-    btn = InlineKeyboardMarkup([[InlineKeyboardButton("🗑️ Tutup Info", callback_data="mi_close")]])
-    await client.send_message(uid, info, reply_markup=btn, parse_mode=enums.ParseMode.MARKDOWN)
-
-@app.on_callback_query(filters.regex(r"^mi_close"))
-async def close_mi_cb(client, cb: CallbackQuery):
-    await cb.message.delete()
-
-@app.on_message(filters.command("merge") & filters.private)
-async def merge_cmd(client, message: Message):
-    uid = message.from_user.id
-    session = get_session(uid)
-    
-    if not session["files"]:
-        await message.reply("Kirimkan beberapa video terlebih dahulu!")
-        return
-    
-    # Disk check
-    free_gb = get_disk_free_gb(TEMP_DIR)
-    if free_gb < MIN_DISK_GB:
-        await message.reply(f"⚠️ Ruang disk kritis: Hanya {free_gb:.1f}GB tersisa. Harap bersihkan server.")
-        return
-
-    if session["status"] != "waiting_files":
-        await message.reply("Proses sedang berjalan.")
-        return
-
-    # Choose Subtitle Mode first
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Softsub (Copy)", callback_data="sub_softsub")],
-        [InlineKeyboardButton("Hardsub (Burn)", callback_data="sub_hardsub")],
-        [InlineKeyboardButton("Tanpa Subtitle", callback_data="sub_none")]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Settings Encoding", callback_data="config_main")],
+        [InlineKeyboardButton("📁 Mulai Kirim File", callback_data="close_menu")]
     ])
-    await message.reply("Pilih mode subtitle:", reply_markup=btn)
-
-@app.on_callback_query(filters.regex(r"^sub_"))
-async def sub_cb(client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    session = get_session(uid)
-    mode = cb.data.split("_")[1]
-    session["sub_mode"] = mode
     
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("MKV", callback_data="fmt_mkv"), InlineKeyboardButton("MP4", callback_data="fmt_mp4")]
-    ])
-    await cb.edit_message_text(f"Mode: {mode.upper()}\nPilih format output:", reply_markup=btn)
+    await callback_query.edit_message_text(text, reply_markup=keyboard)
 
-@app.on_callback_query(filters.regex(r"^fmt_"))
-async def fmt_cb(client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    session = get_session(uid)
-    fmt = cb.data.split("_")[1]
-    session["format"] = fmt
+@bot.on_callback_query(filters.regex(r"^config_main$"))
+async def config_main_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    session = get_session(user_id)
     
-    btn = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Start Merge", callback_data="process_start")],
-        [InlineKeyboardButton("✏️ Rename Hasil", callback_data="process_rename")]
-    ])
-    await cb.edit_message_text(
-        f"Pilihan:\nMode: {session['sub_mode'].upper()}\nFormat: {fmt.upper()}\n"
-        f"Nama: `{session['output_name']}.{fmt}`\n\nSiap memulai?", 
-        reply_markup=btn
+    text = (
+        "📌 **Menu Konfigurasi Encoding**\n\n"
+        f"• Video Encoder: `{session['video_encoder']}`\n"
+        f"• Video Bitrate: `{session['video_bitrate']}`\n"
+        f"• Audio Encoder: `{session['audio_encoder']}`\n"
+        f"• Audio Bitrate: `{session['audio_bitrate']}`\n"
+        f"• CRF: `{session['crf']}`\n"
+        f"• Preset: `{session['preset']}`"
     )
-
-@app.on_callback_query(filters.regex(r"^process_"))
-async def process_cb(client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    session = get_session(uid)
-    action = cb.data.split("_")[1]
     
-    if action == "rename":
-        session["status"] = "waiting_rename"
-        await cb.edit_message_text("📝 **Kirimkan nama file baru (tanpa ekstensi):**\nContoh: `Drakor_Ongoing_E01`")
-    else:
-        await cb.edit_message_text(f"⏳ **Memulai proses...**\nNama: `{session['output_name']}.{session['format']}`")
-        asyncio.create_task(run_merge_process(uid))
-
-@app.on_message(filters.text & filters.private)
-async def text_handler(client, message: Message):
-    uid = message.from_user.id
-    session = get_session(uid)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Video Encoder", callback_data="conf_v_enc"), InlineKeyboardButton("Video Bitrate", callback_data="conf_v_bit")],
+        [InlineKeyboardButton("Audio Encoder", callback_data="conf_a_enc"), InlineKeyboardButton("Audio Bitrate", callback_data="conf_a_bit")],
+        [InlineKeyboardButton("CRF", callback_data="conf_crf"), InlineKeyboardButton("Preset", callback_data="conf_preset")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="close_menu")]
+    ])
     
-    if session["status"] == "waiting_rename":
-        new_name = message.text.strip().replace(" ", "_")
-        # remove extension if user included it
-        new_name = Path(new_name).stem
-        session["output_name"] = new_name
-        session["status"] = "waiting_files" # Return to normal wait
-        
-        text = (
-            f"✅ **Nama file diubah menjadi:** `{new_name}`\n"
-            f"Mode: {session['sub_mode'].upper()}\n"
-            f"Format: {session['format'].upper()}\n\n"
-            "⏳ **Memulai proses...**"
-        )
-        if session["msg"]:
-            try: await session["msg"].edit_text(text)
-            except: session["msg"] = await message.reply(text)
-        else:
-            session["msg"] = await message.reply(text)
-            
-        asyncio.create_task(run_merge_process(uid))
+    await callback_query.edit_message_text(text, reply_markup=keyboard)
 
-async def run_merge_process(uid):
-    session = get_session(uid)
-    user_dir = TEMP_DIR / f"user_{uid}"
-    user_dir.mkdir(exist_ok=True)
+@bot.on_callback_query(filters.regex(r"^close_menu$"))
+async def close_menu_callback(client, callback_query):
+    await callback_query.edit_message_text("✅ Konfigurasi disimpan. Silakan kirim file video Anda.")
+
+# --- Video Encoder Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_v_enc$"))
+async def conf_v_enc_callback(client, callback_query):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Default", callback_data="set_v_enc_Default")],
+        [InlineKeyboardButton("H.264", callback_data="set_v_enc_libx264"), InlineKeyboardButton("H.265", callback_data="set_v_enc_libx265")],
+        [InlineKeyboardButton("VP8", callback_data="set_v_enc_libvpx"), InlineKeyboardButton("VP9", callback_data="set_v_enc_libvpx-vp9")],
+        [InlineKeyboardButton("AV1", callback_data="set_v_enc_libaom-av1"), InlineKeyboardButton("Theora", callback_data="set_v_enc_libtheora")],
+        [InlineKeyboardButton("MPEG4", callback_data="set_v_enc_mpeg4"), InlineKeyboardButton("MPEG2", callback_data="set_v_enc_mpeg2video")],
+        [InlineKeyboardButton("↩️ Kembali", callback_data="config_main")]
+    ])
+    await callback_query.edit_message_text("📌 **Silahkan pilih video encoder anda !**", reply_markup=keyboard)
+
+@bot.on_callback_query(filters.regex(r"^set_v_enc_(.+)$"))
+async def set_v_enc_callback(client, callback_query):
+    val = callback_query.matches[0].group(1)
+    session = get_session(callback_query.from_user.id)
+    session["video_encoder"] = val
+    await config_main_callback(client, callback_query)
+
+# --- Video Bitrate Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_v_bit$"))
+async def conf_v_bit_callback(client, callback_query):
+    rates = ["Default", "500k", "1200k", "2000k", "3000k", "4000k", "5000k", "6000k", "7000k", "8000k", "9000k", "10000k"]
+    buttons = []
+    for i in range(0, len(rates), 2):
+        row = [InlineKeyboardButton(rates[i], callback_data=f"set_v_bit_{rates[i]}")]
+        if i+1 < len(rates):
+            row.append(InlineKeyboardButton(rates[i+1], callback_data=f"set_v_bit_{rates[i+1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Kembali", callback_data="config_main")])
+    await callback_query.edit_message_text("📌 **Silahkan pilih video bitrate anda !**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_callback_query(filters.regex(r"^set_v_bit_(.+)$"))
+async def set_v_bit_callback(client, callback_query):
+    val = callback_query.matches[0].group(1)
+    session = get_session(callback_query.from_user.id)
+    session["video_bitrate"] = val
+    await config_main_callback(client, callback_query)
+
+# --- Audio Encoder Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_a_enc$"))
+async def conf_a_enc_callback(client, callback_query):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Default", callback_data="set_a_enc_Default")],
+        [InlineKeyboardButton("AAC", callback_data="set_a_enc_aac"), InlineKeyboardButton("MP3", callback_data="set_a_enc_libmp3lame")],
+        [InlineKeyboardButton("Opus", callback_data="set_a_enc_libopus"), InlineKeyboardButton("Vorbis", callback_data="set_a_enc_libvorbis")],
+        [InlineKeyboardButton("WAV", callback_data="set_a_enc_pcm_s16le"), InlineKeyboardButton("MPEG", callback_data="set_a_enc_mp2")],
+        [InlineKeyboardButton("FLAC", callback_data="set_a_enc_flac"), InlineKeyboardButton("ALAC", callback_data="set_a_enc_alac")],
+        [InlineKeyboardButton("↩️ Kembali", callback_data="config_main")]
+    ])
+    await callback_query.edit_message_text("📌 **Silahkan pilih audio encoder anda !**", reply_markup=keyboard)
+
+@bot.on_callback_query(filters.regex(r"^set_a_enc_(.+)$"))
+async def set_a_enc_callback(client, callback_query):
+    val = callback_query.matches[0].group(1)
+    session = get_session(callback_query.from_user.id)
+    session["audio_encoder"] = val
+    await config_main_callback(client, callback_query)
+
+# --- Audio Bitrate Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_a_bit$"))
+async def conf_a_bit_callback(client, callback_query):
+    rates = ["Default", "32 kbps", "64 kbps", "96 kbps", "128 kbps", "192 kbps", "256 kbps", "320 kbps", "512 kbps"]
+    buttons = []
+    for i in range(0, len(rates), 2):
+        row = [InlineKeyboardButton(rates[i], callback_data=f"set_a_bit_{rates[i].replace(' ', '_')}")]
+        if i+1 < len(rates):
+            row.append(InlineKeyboardButton(rates[i+1], callback_data=f"set_a_bit_{rates[i+1].replace(' ', '_')}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Kembali", callback_data="config_main")])
+    await callback_query.edit_message_text("📌 **Silahkan pilih audio bitrate anda !**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_callback_query(filters.regex(r"^set_a_bit_(.+)$"))
+async def set_a_bit_callback(client, callback_query):
+    val = callback_query.matches[0].group(1).replace("_", " ")
+    session = get_session(callback_query.from_user.id)
+    session["audio_bitrate"] = val
+    await config_main_callback(client, callback_query)
+
+# --- Preset Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_preset$"))
+async def conf_preset_callback(client, callback_query):
+    presets = ["Default", "Ultrafast", "Superfast", "Veryfast", "Faster", "Fast", "Medium", "Slow", "Slower", "Veryslow"]
+    buttons = []
+    for i in range(0, len(presets), 2):
+        row = [InlineKeyboardButton(presets[i], callback_data=f"set_preset_{presets[i]}")]
+        if i+1 < len(presets):
+            row.append(InlineKeyboardButton(presets[i+1], callback_data=f"set_preset_{presets[i+1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Kembali", callback_data="config_main")])
+    text = (
+        "📌 **Silahkan pilih preset anda !**\n\n"
+        "⚠️ **Note:** Semakin cepat proses kompresi, semakin besar ukuran file video"
+    )
+    await callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_callback_query(filters.regex(r"^set_preset_(.+)$"))
+async def set_preset_callback(client, callback_query):
+    val = callback_query.matches[0].group(1)
+    session = get_session(callback_query.from_user.id)
+    session["preset"] = val
+    await config_main_callback(client, callback_query)
+
+# --- CRF Menu ---
+@bot.on_callback_query(filters.regex(r"^conf_crf$"))
+async def conf_crf_callback(client, callback_query):
+    crfs = ["Default", "18", "20", "23", "25", "28", "30"]
+    buttons = []
+    for i in range(0, len(crfs), 2):
+        row = [InlineKeyboardButton(crfs[i], callback_data=f"set_crf_{crfs[i]}")]
+        if i+1 < len(crfs):
+            row.append(InlineKeyboardButton(crfs[i+1], callback_data=f"set_crf_{crfs[i+1]}"))
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("↩️ Kembali", callback_data="config_main")])
+    await callback_query.edit_message_text("📌 **Silahkan pilih CRF anda !**", reply_markup=InlineKeyboardMarkup(buttons))
+
+@bot.on_callback_query(filters.regex(r"^set_crf_(.+)$"))
+async def set_crf_callback(client, callback_query):
+    val = callback_query.matches[0].group(1)
+    session = get_session(callback_query.from_user.id)
+    session["crf"] = val
+    await config_main_callback(client, callback_query)
+
+@bot.on_message(filters.video | filters.document)
+async def file_handler(client, message):
+    logger.info(f"Received file from {message.from_user.id}")
+    user_id = message.from_user.id
+    session = get_session(user_id)
     
-    try:
-        session["status"] = "processing"
-        
-        # 1. DOWNLOAD
-        downloaded_files = []
-        for i, msg in enumerate(session["files"]):
-            if session["cancel"]: 
-                return
+    if session["status"] == "MERGING":
+        return await message.reply_text("⚠️ Tunggu proses merge selesai sebelum mengirim file baru.")
+    
+    file = message.video or message.document
+    if not file: return
+    
+    file_name = file.file_name
+    if not (file_name.lower().endswith(".mkv") or file_name.lower().endswith(".mp4")):
+        return
+    
+    session["status"] = "DROPPING_FILES"
+    status_msg = await message.reply_text("📥 Mendownload file...")
+    
+    async def download_worker():
+        try:
+            user_dir = get_user_temp_dir(user_id)
+            file_path = await download_tg(client, message, user_dir)
             
-            file_name = (msg.video.file_name if msg.video else msg.document.file_name) or f"episode_{i+1}.mp4"
-            file_path = user_dir / file_name
+            # Validasi file size
+            if os.path.getsize(str(file_path)) == 0:
+                os.remove(str(file_path))
+                raise Exception("File kosong (0 byte) terdeteksi.")
+                
+            # Ensure files is a list
+            if not isinstance(session["files"], list):
+                session["files"] = []
+                
+            session["files"].append(str(file_path))
+            session["files"] = list(sort_episodes(session["files"]))
             
-            async def dl_cb(current, total, pct, text):
-                await update_status_msg(uid, f"📥 **Downloading ({i+1}/{len(session['files'])})**\n\n{text}")
+            user_files = session["files"]
+            file_list_text = "\n".join([f"{i+1}. {os.path.basename(str(f))}" for i, f in enumerate(user_files)])
             
-            await downloader.download_video(msg, file_path, progress_callback=dl_cb)
-            
-            if not file_path.exists() or file_path.stat().st_size == 0:
-                await app.send_message(uid, f"❌ File {file_name} gagal didownload.\nProses dihentikan.")
-                return
-            downloaded_files.append(file_path)
-
-        if session["cancel"]: 
-            return
-
-        # 2. SORTING
-        await update_status_msg(uid, "🔄 **Mengurutkan episode...**", force=True)
-        
-        file_sort_data = []
-        for i, path in enumerate(downloaded_files):
-            msg = session["files"][i]
-            caption = msg.caption or ""
-            search_text = f"{path.name} {caption}"
-            file_sort_data.append({"path": path, "search_text": search_text})
-            
-        sorted_files = sort_episode_order(file_sort_data)
-        
-        # Notify user of sorted list
-        file_list_text = "📋 **Urutan Episode Terdeteksi:**\n"
-        for i, f in enumerate(sorted_files):
-            file_list_text += f"{i+1}. `{f.name}`\n"
-        await app.send_message(uid, file_list_text)
-        
-        # 3. MERGE
-        concat_list = user_dir / "list.txt"
-        await generate_concat_list(sorted_files, concat_list)
-        
-        output_file = user_dir / f"{session['output_name']}.{session['format']}"
-        total_duration = 0.0
-        for f in sorted_files:
-            total_duration += await get_video_duration(f)
-        
-        async def merge_cb(pct, time_ms):
-            bar = progress_bar(pct)
-            await update_status_msg(uid, f"⚙️ **Merging ({session['sub_mode'].upper()})...**\n\n`{bar}` {pct:.1f}%\nDurasi: {format_duration(time_ms)}")
-
-        success = await merge_video_files(
-            concat_list, output_file, total_duration, 
-            output_format=session['format'], sub_mode=session['sub_mode'], 
-            progress_callback=merge_cb
-        )
-        
-        if session["cancel"]:
-            return
-
-        if success and output_file.exists():
-            # 4. UPLOAD
-            await update_status_msg(uid, "📤 **Uploading hasil merge...**", force=True)
-            
-            # Extract MediaInfo before cleanup
-            session["last_mediainfo"] = await get_mediainfo(output_file)
-            
-            async def up_cb(current, total):
-                pct = (current / total * 100) if total > 0 else 0
-                await update_status_msg(uid, f"📤 **Uploading...**\n\nProgress: {pct:.1f}%")
-
-            reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 MediaInfo", callback_data="mi_show")]])
-            
-            await app.send_video(
-                uid,
-                video=str(output_file),
-                caption=(
-                    f"✅ **Berhasil digabung!**\n\n"
-                    f"🎬 Ep: {len(sorted_files)} file\n"
-                    f"🛠️ Mode: {session['sub_mode'].upper()}\n"
-                    f"📦 Format: {session['format'].upper()}"
-                ),
-                progress=up_cb,
-                reply_markup=reply_markup
+            response = (
+                f"✅ **Episode diterima:**\n\n"
+                f"{file_list_text}\n\n"
+                f"**Total:** {len(user_files)}\n\n"
+                f"Ketik /merge untuk mulai atau /cancel untuk reset."
             )
-        else:
-            await app.send_message(uid, "❌ Gagal melakukan penggabungan video.")
+            await status_msg.edit_text(response)
+        except asyncio.CancelledError:
+            logger.info(f"Download task for user {user_id} was cancelled.")
+            await status_msg.edit_text("❌ Download dibatalkan.")
+        except Exception as e:
+            logger.error(f"Download error for user {user_id}: {e}")
+            await status_msg.edit_text(f"❌ Gagal: {e}")
+        finally:
+            session["status"] = "IDLE"
+            session["current_task"] = None
 
-    except asyncio.CancelledError:
-        logger.info(f"Process cancelled for user {uid}")
-        await app.send_message(uid, "⛔ **Proses dibatalkan.**")
-    except Exception as e:
-        logger.error(f"Error in merge process for user {uid}: {e}", exc_info=True)
-        await app.send_message(uid, f"❌ **Bot mengalami kesalahan fatal!**\nKesalahan: `{str(e)}`\n\nBot akan mencoba memulihkan diri (restart).")
-    finally:
-        cleanup_temp_files(uid, TEMP_DIR)
-        user_sessions.pop(uid, None)
+    task = asyncio.create_task(download_worker())
+    session["current_task"] = task
+
+@bot.on_message(filters.command("merge"))
+async def merge_handler(client, message):
+    logger.info(f"Received /merge from {message.from_user.id}")
+    user_id = message.from_user.id
+    session = get_session(user_id)
+    
+    # Validasi Input
+    user_files = session.get("files")
+    if not isinstance(user_files, list) or not user_files:
+        return await message.reply_text("❌ Kirim beberapa file dulu!")
+    
+    if len(user_files) < 2:
+        return await message.reply_text("❌ Minimal kirim 2 file untuk digabung.")
+
+    if session["status"] == "MERGING":
+        return await message.reply_text("⚠️ Proses merge sedang berjalan...")
+    
+    # Cek keberadaan file fisik
+    user_files = session.get("files")
+    if not isinstance(user_files, list):
+        user_files = []
+        
+    valid_files = [str(f) for f in user_files if os.path.exists(str(f)) and os.path.getsize(str(f)) > 0]
+    if len(valid_files) != len(user_files):
+        session["files"] = valid_files
+        return await message.reply_text("⚠️ Beberapa file hilang atau rusak. Silakan kirim ulang.")
+
+    session["status"] = "MERGING"
+    status_msg = await message.reply_text("🚀 Memulai proses penggabungan...")
+    
+    async def merge_worker():
+        try:
+            mode = session["mode"]
+            user_files = session.get("files", [])
+            if not isinstance(user_files, list): user_files = []
+            
+            # Pass all encoding settings
+            settings = {
+                "video_encoder": session.get("video_encoder", "Default"),
+                "video_bitrate": session.get("video_bitrate", "Default"),
+                "audio_encoder": session.get("audio_encoder", "Default"),
+                "audio_bitrate": session.get("audio_bitrate", "Default"),
+                "crf": session.get("crf", "Default"),
+                "preset": session.get("preset", "Default")
+            }
+            
+            output_path = await merge_video_files(user_files, user_id, mode, status_msg, settings)
+            
+            if not output_path: # Cancelled or failed
+                return
+
+            session["status"] = "UPLOADING"
+            await status_msg.edit_text("📤 Mengunggah hasil ke Telegram...")
+            
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=output_path,
+                caption=f"✅ **Merge Berhasil!**\n\nMode: {'Softsub' if mode == 1 else 'Hardsub'}\nTotal Episode: {len(user_files)}",
+                supports_streaming=True
+            )
+            
+            await status_msg.delete()
+            cleanup_temp_files(user_id)
+            session["files"] = []
+        except asyncio.CancelledError:
+            logger.info(f"Merge task for user {user_id} was cancelled.")
+            cancel_merge(user_id)
+            await status_msg.edit_text("❌ Proses merge dibatalkan.")
+        except Exception as e:
+            logger.error(f"Merge error for user {user_id}: {e}")
+            await status_msg.edit_text(f"❌ Terjadi kesalahan: {e}")
+        finally:
+            cleanup_temp_files(user_id)
+            session["status"] = "IDLE"
+            session["current_task"] = None
+
+    task = asyncio.create_task(merge_worker())
+    session["current_task"] = task
+
+@bot.on_message(filters.command("cancel"))
+async def cancel_handler(client, message):
+    user_id = message.from_user.id
+    session = get_session(user_id)
+    
+    cancelled_anything = False
+    
+    # 1. Cancel active asyncio task
+    if session.get("current_task"):
+        session["current_task"].cancel()
+        cancelled_anything = True
+        
+    # 2. Kill FFmpeg process if any
+    if cancel_merge(user_id):
+        cancelled_anything = True
+        
+    # 3. Clean up
+    cleanup_temp_files(user_id)
+    session["files"] = []
+    session["status"] = "IDLE"
+    session["current_task"] = None
+    
+    msg = "🛑 **Proses dibatalkan!** Antrian Anda telah dibersihkan." if cancelled_anything else "🗑️ Antrian Anda kosong."
+    await message.reply_text(msg)
+
+@bot.on_message(filters.command("status"))
+async def status_handler(client, message):
+    user_id = message.from_user.id
+    session = get_session(user_id)
+    user_files = session.get("files", [])
+    if not isinstance(user_files, list): user_files = []
+    
+    await message.reply_text(
+        f"📊 **Status Saat Ini**\n\n"
+        f"• File Antrian: {len(user_files)}\n"
+        f"• Status Bot: `{session['status']}`\n"
+        f"• Mode: {'Softsub' if session['mode'] == 1 else 'Hardsub'}\n\n"
+        "📌 **Encoding Settings:**\n"
+        f"• Video Encoder: `{session.get('video_encoder', 'Default')}`\n"
+        f"• Video Bitrate: `{session.get('video_bitrate', 'Default')}`\n"
+        f"• Audio Encoder: `{session.get('audio_encoder', 'Default')}`\n"
+        f"• Audio Bitrate: `{session.get('audio_bitrate', 'Default')}`\n"
+        f"• CRF: `{session.get('crf', 'Default')}`\n"
+        f"• Preset: `{session.get('preset', 'Default')}`"
+    )
+
+@bot.on_message(filters.command("help"))
+async def help_handler(client, message):
+    help_text = (
+        "📖 **Cara Menggunakan Bot:**\n\n"
+        "1. Jalankan /start\n"
+        "2. Kirim minimal 2 file video (MKV/MP4)\n"
+        "3. Tunggu hingga semua file terdaftar\n"
+        "4. Ketik /merge untuk mulai proses\n"
+        "5. Gunakan /cancel jika ingin reset antrian\n\n"
+        "Bot akan otomatis mengurutkan episode berdasarkan angka di nama file."
+    )
+    await message.reply_text(help_text)
+
+@bot.on_message(filters.all)
+async def debug_handler(client, message):
+    logger.info(f"CATCH-ALL: Received message type {message.media} from {message.from_user.id if message.from_user else 'unknown'}")
+
+async def start_bot():
+    logger.info("Bot starting...")
+    await bot.start()
+    me = await bot.get_me()
+    logger.info(f"Bot is online! Username: @{me.username} (ID: {me.id})")
+    asyncio.create_task(auto_cleaner())
+    await idle()
+    await bot.stop()
 
 if __name__ == "__main__":
-    logger.info("Bot starting...")
-    app.run()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(start_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+    except Exception as e:
+        logger.fatal(f"Bot crashed: {e}")
+    finally:
+        loop.close()
