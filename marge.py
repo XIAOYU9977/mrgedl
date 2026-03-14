@@ -363,26 +363,15 @@ class MergeSession:
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
     def get_download_status(self) -> str:
-        """Bangun teks status terpadu untuk semua download aktif."""
-        if not self.active_downloads:
-            return "**Mempersiapkan download...**"
+        """Bangun teks status minimalist sesuai permintaan user."""
+        n_active = len(self.active_downloads)
+        n_done = len(self.videos)
+        total = n_active + n_done
         
-        lines = ["📥 **Sedang Mendownload...**\n"]
-        for msg_id, info in self.active_downloads.items():
-            name     = info.get("name", "Unknown")
-            received = info.get("received", 0)
-            total    = info.get("total", 0)
-            speed    = info.get("speed", 0)
-            pct      = received / total * 100 if total else 0
+        if n_active == 0:
+            return f"✅ **File selesai diupload {n_done}/{n_done}**"
             
-            bar = progress_bar(pct)
-            lines.append(
-                f"📄 `{name}`\n"
-                f"{bar} {pct:.1f}%\n"
-                f"   {format_size(received)} / {format_size(total)} | {format_speed(speed)}\n"
-            )
-        
-        return "\n".join(lines)
+        return f"📥 **File diterima {n_done}/{total}**\n(Sedang memproses {n_active} file...)"
 
     async def request_cancel(self):
         """Tandai session untuk dibatalkan secara paksa."""
@@ -889,29 +878,29 @@ class TelegramBot:
     async def update_status(self, session: MergeSession, text: str,
                              buttons=None, parse_mode: str = 'md', force_repost: bool = False):
         try:
-            # Singleton: Jika repost atau belum ada pesan, hapus yang lama dulu
-            if force_repost or not session.status_message:
-                if session.status_message:
+            # Singleton: Jika belum ada pesan, kirim baru
+            if not session.status_message or force_repost:
+                if force_repost and session.status_message:
                     try: await session.status_message.delete()
                     except: pass
-            else:
-                # Coba edit pesan yang ada
-                try:
-                    await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
-                    return
-                except MessageNotModifiedError:
-                    # Teks sama, tidak perlu kirim baru
-                    return
-                except Exception:
-                    # Edit gagal lainnya, kirim baru di bawah
-                    pass
+                
+                session.status_message = await self.client.send_message(
+                    session.user_id, text, buttons=buttons, parse_mode=parse_mode
+                )
+                return
 
-            # Kirim pesan baru sebagai singleton
-            session.status_message = await self.client.send_message(
-                session.user_id, text, buttons=buttons, parse_mode=parse_mode
-            )
+            # Jika sudah ada, HANYA EDIT. Jangan pernah kirim baru di sini.
+            try:
+                await session.status_message.edit(text, buttons=buttons, parse_mode=parse_mode)
+            except MessageNotModifiedError:
+                pass
+            except Exception as e:
+                # Jika pesan dihapus atau error lain, biarkan loop berikutnya (jika ada) yang handle 
+                # atau biarkan saja agar tidak spam.
+                logger.debug(f"Edit failed (silent): {e}")
+                
         except Exception as e:
-            logger.error(f"update_status error: {e}")
+            logger.error(f"update_status critical error: {e}")
 
     async def start_status_refresh_loop(self, session: MergeSession):
         """Task background untuk update status message secara berkala."""
@@ -1010,15 +999,13 @@ class TelegramBot:
             return
 
         async with session.status_lock:
-            # Atomic session creation already handled by dict check,
-            # but we use lock to avoid double status message creation.
             if not session.status_message:
                 session.status_message = await self.client.send_message(
-                    uid, "**Mempersiapkan download...**", parse_mode='md'
+                    uid, "📥 **Mulai menerima file...**", parse_mode='md'
                 )
             else:
-                # Update but don't spam if text is identical (handled in update_status)
-                await self.update_status(session, "**Mempersiapkan download...**", force_repost=False)
+                # Update status segera (File diterima X/Y)
+                await self.update_status(session, session.get_download_status())
 
         start_time = time.time()
         last_upd   = [time.time()]
@@ -1527,13 +1514,7 @@ class TelegramBot:
                         progress_callback=upload_progress,
                     )
 
-                    ul_elapsed = time.time() - ul_start
-                    avg_spd    = out_size / ul_elapsed if ul_elapsed > 0 else 0
-                    logger.info(f"Upload selesai: {format_size(out_size)} dalam {ul_elapsed:.1f}s avg {format_speed(avg_spd)}")
-
-                    if session.status_message:
-                        try: await session.status_message.delete()
-                        except: pass
+                    await self.update_status(session, f"✅ **File selesai diupload {len(session.videos)}/{len(session.videos)}**")
                 elif message == "CANCELLED":
                     # User tekan /cancel — tidak perlu pesan error
                     logger.info(f"Merge cancelled untuk user {uid}")
