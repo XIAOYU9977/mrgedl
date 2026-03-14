@@ -14,13 +14,29 @@ from bot.cleaner import auto_cleaner
 # Logging Setup
 logger = logging.getLogger(__name__)
 
+from typing import Dict, List, Any, Optional, Union, TypedDict, cast
+import asyncio
+
 # User Session Management
 # States: IDLE, DROPPING_FILES, MERGING, UPLOADING
-user_sessions = {}
 
-def get_session(user_id):
+class UserSession(TypedDict, total=False):
+    files: List[str]
+    mode: int
+    status: str
+    current_task: Optional[asyncio.Task]
+    video_encoder: str
+    video_bitrate: str
+    audio_encoder: str
+    audio_bitrate: str
+    preset: str
+    crf: str
+
+user_sessions: Dict[int, UserSession] = {}
+
+def get_session(user_id: int) -> UserSession:
     if user_id not in user_sessions:
-        user_sessions[user_id] = {
+        user_sessions[user_id] = cast(UserSession, {
             "files": [],
             "mode": 1,
             "status": "IDLE",
@@ -31,7 +47,7 @@ def get_session(user_id):
             "audio_bitrate": "Default",
             "preset": "Default",
             "crf": "Default"
-        }
+        })
     return user_sessions[user_id]
 
 bot = Client(
@@ -277,13 +293,16 @@ async def file_handler(client, message):
                 raise Exception("File kosong (0 byte) terdeteksi.")
                 
             # Ensure files is a list
-            if not isinstance(session["files"], list):
-                session["files"] = []
+            current_files = session.get("files")
+            if not isinstance(current_files, list):
+                current_files = []
+                session["files"] = current_files
                 
-            session["files"].append(str(file_path))
-            session["files"] = list(sort_episodes(session["files"]))
+            current_files.append(str(file_path))
+            sorted_files = list(sort_episodes(current_files))
+            session["files"] = sorted_files
             
-            user_files = session["files"]
+            user_files = sorted_files
             file_list_text = "\n".join([f"{i+1}. {os.path.basename(str(f))}" for i, f in enumerate(user_files)])
             
             response = (
@@ -393,8 +412,9 @@ async def cancel_handler(client, message):
     cancelled_anything = False
     
     # 1. Cancel active asyncio task
-    if session.get("current_task"):
-        session["current_task"].cancel()
+    task = cast(Optional[asyncio.Task], session.get("current_task"))
+    if task and not task.done():
+        task.cancel()
         cancelled_anything = True
         
     # 2. Kill FFmpeg process if any
